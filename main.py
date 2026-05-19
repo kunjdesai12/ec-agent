@@ -66,7 +66,7 @@ Output: {"restaurant_name": null, "menu_item": "pav bhaji", "cuisine": null}
 """
 
 # Loading the Qwen model locally
-LLAMA_MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models", "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf")
+LLAMA_MODEL_PATH = "./STT_backend/models/qwen2.5-1.5B-instruct-q4_k_m.gguf"
 
 llm = Llama(
     model_path=LLAMA_MODEL_PATH,

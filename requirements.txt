@@ -12,4 +12,7 @@ sarvamai
 llama-cpp-python
 psycopg2
 sentence-transformers
-langchain
+langchain-core
+httpx
+requests
+tqdm
