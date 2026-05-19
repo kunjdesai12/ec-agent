@@ -1,0 +1,24 @@
+# Web framework
+fastapi
+uvicorn[standard]
+
+# Database
+psycopg2-binary
+
+# HTTP clients
+httpx
+requests
+
+# AI / ML
+sentence-transformers
+llama-cpp-python
+
+# LangChain
+langchain-core
+
+# Data validation
+pydantic
+
+# Utilities
+python-dotenv
+tqdm

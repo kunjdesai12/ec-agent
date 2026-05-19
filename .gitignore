@@ -10,8 +10,3 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
-
-food_ner_model
-food_ner_model_backup/
-
-/dataset
