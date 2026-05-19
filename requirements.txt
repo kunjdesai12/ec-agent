@@ -1,24 +1,18 @@
-# Web framework
 fastapi
-uvicorn[standard]
-
-# Database
-psycopg2-binary
-
-# HTTP clients
+uvicorn
+transformers
+torch
+torchaudio
+librosa
+soundfile
+python-multipart
+accelerate
+dotenv
+sarvamai
+llama-cpp-python
+psycopg2
+sentence-transformers
+langchain-core
 httpx
 requests
-
-# AI / ML
-sentence-transformers
-llama-cpp-python
-
-# LangChain
-langchain-core
-
-# Data validation
-pydantic
-
-# Utilities
-python-dotenv
 tqdm
