@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+transformers
+torch
+torchaudio
+librosa
+soundfile
+python-multipart
+accelerate
+dotenv
+sarvamai
+llama-cpp-python
+psycopg2
+sentence-transformers
+langchain
