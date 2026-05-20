@@ -1,5 +1,6 @@
 import os
 import json
+import re
 
 import psycopg2
 import psycopg2.extras
@@ -49,7 +50,7 @@ You are a structured data extractor for a food delivery app.
 Given a user message, extract the following fields:
 - restaurant_name: the name of the restaurant the user mentions (or null)
 - menu_item: the specific food or drink item the user mentions (or null)
-- cuisine: the type of cuisine ONLY IF the user explicitly mentions it (or null)
+- cuisine: the broad cuisine category ONLY IF the user explicitly states it as a category (e.g. "Chinese food", "Indian cuisine", "South Indian"). Return null if cuisine is not explicitly stated as a category.
 
 Rules:
 - Extract ONLY what is literally present in the user's message. Do NOT invent, substitute, or guess items not mentioned.
@@ -59,6 +60,10 @@ Rules:
 - Never infer cuisine from the food item name.
 - Return ONLY a valid JSON object. No explanation, no markdown, no extra text.
 - If a field is not present, use null.
+- "cuisine" must be a broad food category. Word fragments inside dish names (e.g. "hakka" in "hakka noodles"), words inside restaurant names (e.g. "Punjabi" in "Punjabi Dhaba"), and food descriptors (e.g. "spicy", "crispy", "sweet") are NOT cuisine values — set cuisine to null in these cases.
+- If the user says "I want something spicy" or "I want spicy food", cuisine is null. If the user says "I want Kashmiri food" or "show me Chinese options", extract the cuisine.
+- NEVER infer cuisine from your knowledge of what category a dish or restaurant belongs to. "Chicken tikka masala" does not make cuisine "Indian". "Burger" does not make cuisine "American". "McDonald's" does not make cuisine "Fast Food". "Veg manchurian" does not make cuisine "Chinese". "Lasagna" or "Bella Italia" does not make cuisine "Italian". Cuisine is null unless the user explicitly says the cuisine category word themselves.
+- When cuisine IS present, return ONLY the bare category word or phrase. Never append extra words to it. Return "Chinese" not "Chinese cuisine". Return "South Indian" not "South Indian food". Return "Italian" not "Italian cuisine".
 
 Example:
 User: "I want to eat pav bhaji"
@@ -66,7 +71,7 @@ Output: {"restaurant_name": null, "menu_item": "pav bhaji", "cuisine": null}
 """
 
 # Loading the Qwen model locally
-LLAMA_MODEL_PATH = "./STT_backend/models/qwen2.5-1.5B-instruct-q4_k_m.gguf"
+LLAMA_MODEL_PATH = "./models/qwen2.5-1.5B-instruct-q4_k_m.gguf"
 
 llm = Llama(
     model_path=LLAMA_MODEL_PATH,
@@ -89,16 +94,17 @@ def extract_entities(prompt: str, cache_prompt: bool = False) -> dict:
     
     try:
         extracted = json.loads(raw_content)
+
     except json.JSONDecodeError:
-        import re
-        match = re.search(r"\{.*\}", raw_content, re.DOTALL)
+        match = re.search(r"\{.*?\}", raw_content, re.DOTALL)
         if match:
-            extracted = json.loads(match.group())
+            try:
+                extracted = json.loads(match.group())
+            except json.JSONDecodeError:
+                extracted = {}
         else:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Could not parse JSON from Qwen response: {raw_content}"
-            )
+            extracted = {}
+
     return {
         "restaurant_name": extracted.get("restaurant_name"),
         "menu_item":       extracted.get("menu_item"),
@@ -116,32 +122,49 @@ def embed(text: str) -> list[float]:
 
 
 # Step 3 — Vector similarity search in pgvector
-def search_embeddings(query: str, limit: 9999) -> list[dict]:
+def search_embeddings(extracted: dict, limit: int = 5) -> list[dict]:
     """
-    Single vector search against restaurant_embeddings using pgvector.
-    Returns all rows sorted by similarity (top-k applied later).
+    Field-aware vector search. Builds a targeted query string per extracted
+    field so restaurant names match against restaurant names and menu items
+    match against menu items, rather than competing in a single combined search.
     """
-    query_vec = embed(query)
+    restaurant_raw = extracted.get("restaurant_name")
+    menu_item_raw  = extracted.get("menu_item")
+    cuisine_raw    = extracted.get("cuisine")
+
+    query_parts = []
+    if restaurant_raw:
+        query_parts.append(f"Restaurant Name: {restaurant_raw}")
+    if cuisine_raw:
+        query_parts.append(f"Cuisine: {cuisine_raw}")
+    if menu_item_raw:
+        query_parts.append(f"Menu Item: {menu_item_raw}")
+
+    targeted_query = ". ".join(query_parts) if query_parts else ""
+
+    if not targeted_query:
+        return []
+
+    query_vec = embed(targeted_query)
+
     conn = psycopg2.connect(**DB_CONFIG)
     cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    
+
     cursor.execute(
         """
         SELECT *,
-            (embedding <#> %s::vector) AS similarity
+            1.0 - (embedding <=> %s::vector) AS similarity
         FROM restaurant_embeddings
-        ORDER BY similarity ASC
+        ORDER BY similarity DESC
         LIMIT %s
         """,
         (query_vec, limit)
     )
+    
     results = cursor.fetchall()
     cursor.close()
     conn.close()
-    # Convert similarity to descending (higher is better)
-    for r in results:
-        r["similarity"] = 1.0 - r["similarity"]  # If using <#> (L2 distance)
-    results.sort(key=lambda x: x["similarity"], reverse=True)
+
     return results
 
 
@@ -190,15 +213,8 @@ def extract_and_search(request: UserPromptRequest):
     menu_item_raw  = extracted["menu_item"]
     cuisine_raw    = extracted["cuisine"]
 
-    query_parts = []
-    if restaurant_raw: query_parts.append(f"Restaurant: {restaurant_raw}")
-    if menu_item_raw:  query_parts.append(f"Menu Item: {menu_item_raw}")
-    if cuisine_raw:    query_parts.append(f"Cuisine: {cuisine_raw}")
-
-    combined_query = ". ".join(query_parts) if query_parts else request.prompt
-
     k = get_top_k(extracted)
-    top_matches = search_embeddings(combined_query, limit=k)
+    top_matches = search_embeddings(extracted, limit=k)
 
     best = top_matches[0] if top_matches else {}
 
