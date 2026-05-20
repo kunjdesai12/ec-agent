@@ -7,10 +7,10 @@ librosa
 soundfile
 python-multipart
 accelerate
-dotenv
+python-dotenv
 sarvamai
 llama-cpp-python
-psycopg2
+psycopg2-binary
 sentence-transformers
 langchain-core
 httpx
