@@ -57,7 +57,8 @@ def fetch_source_rows(cursor, last_synced_at):
             restaurant_id,
             restaurant_name,
             food_item,
-            combined_text
+            combined_text,
+            cuisine_name
         FROM restaurant_menu_view
         WHERE updated_at > %s
     """, (last_synced_at,))
@@ -69,7 +70,7 @@ def upsert_batch(cursor, records):
         cursor,
         """
         INSERT INTO restaurant_embeddings
-            (menu_item_id, restaurant_id, restaurant_name, food_item, combined_text, embedding)
+            (menu_item_id, restaurant_id, restaurant_name, food_item, combined_text, embedding, restaurant_name_embedding, food_item_embedding, cuisine_embedding)
         VALUES %s
         ON CONFLICT (menu_item_id)
         DO UPDATE SET
@@ -77,10 +78,13 @@ def upsert_batch(cursor, records):
             restaurant_name = EXCLUDED.restaurant_name,
             food_item       = EXCLUDED.food_item,
             combined_text   = EXCLUDED.combined_text,
-            embedding       = EXCLUDED.embedding
+            embedding       = EXCLUDED.embedding,
+            restaurant_name_embedding = EXCLUDED.restaurant_name_embedding,
+            food_item_embedding       = EXCLUDED.food_item_embedding,
+            cuisine_embedding         = EXCLUDED.cuisine_embedding
         """,
         records,
-        template="(%s, %s, %s, %s, %s, %s::vector)",
+        template="(%s, %s, %s, %s, %s, %s::vector, %s::vector, %s::vector, %s::vector)",
     )
 
 
@@ -118,8 +122,23 @@ def run_sync():
         for i in tqdm(range(0, len(rows), BATCH_SIZE), desc="Batches"):
             batch = rows[i : i + BATCH_SIZE]
 
-            embeddings = model.encode(
+            combined_embeddings = model.encode(
                 [row[4] for row in batch],
+                show_progress_bar=False
+            )
+
+            restaurant_name_embeddings = model.encode(
+                [row[2] or "" for row in batch],
+                show_progress_bar=False
+            )
+
+            food_item_embeddings = model.encode(
+                [row[3] or "" for row in batch],
+                show_progress_bar=False
+            )
+
+            cuisine_embeddings = model.encode(
+                [row[5] or "" for row in batch],
                 show_progress_bar=False
             )
 
@@ -130,7 +149,10 @@ def run_sync():
                     row[2],
                     row[3],
                     row[4],
-                    embeddings[j].tolist(),
+                    combined_embeddings[j].tolist(),
+                    restaurant_name_embeddings[j].tolist(),
+                    food_item_embeddings[j].tolist(),
+                    cuisine_embeddings[j].tolist()
                 )
                 for j, row in enumerate(batch)
             ]
