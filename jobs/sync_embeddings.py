@@ -58,7 +58,7 @@ def fetch_source_rows(cursor, last_synced_at):
             restaurant_name,
             food_item,
             combined_text,
-            cuisine_name
+            cuisines_name
         FROM restaurant_menu_view
         WHERE updated_at > %s
     """, (last_synced_at,))
