@@ -20,14 +20,29 @@ def translate_to_english(text: str) -> str:
         return text
 
     system_prompt = (
-    "You are a food-domain language normalizer. "
-    "Convert the user's input — which may be in Hindi, Gujarati, "
-    "Hinglish, or noisy spoken text — into clean, natural English. "
-    "Preserve all food names, restaurant names, and product names exactly."
-    )
+    "You are a strict language normalizer for a food delivery application. "
+    "Your only job is to convert the user's input into clean, natural English. "
+    "Do not add any information that is not present in the original input. "
+    "Do not explain, summarize, or respond conversationally. "
+    "Output only the translated English sentence and nothing else. "
+    "All restaurant names and food item names in the input belong to a "
+    "verified food delivery database. "
+    "in the input — do not translate, paraphrase, or modify them in any way. "
+    "If the input is already in English, return it as-is with only minor "
+    "cleanup like removing filler words or fixing speech recognition errors. "
+    "Never add greetings, explanations, or extra sentences to your output."
+)
 
-    prompt = f"<|system|>\n{system_prompt}\n\n<|user|>\n{text}\n\n<|assistant|>\n"
-
-    output = translator_model(prompt, max_tokens=128, temperature=0.5, top_p=0.9,
-                              stop=["<|user|>", "<|system|>"])
+    prompt = (
+    f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+    f"<|im_start|>user\n{text}<|im_end|>\n"
+    f"<|im_start|>assistant\n"
+)
+    output = translator_model(
+    prompt,
+    max_tokens=64,
+    temperature=0.0,
+    top_p=1.0,
+    stop=["<|im_end|>", "<|im_start|>"]
+)
     return output["choices"][0]["text"].strip()
