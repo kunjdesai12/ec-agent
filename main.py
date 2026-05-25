@@ -124,48 +124,87 @@ def embed(text: str) -> list[float]:
 # Step 3 — Vector similarity search in pgvector
 def search_embeddings(extracted: dict, limit: int = 5) -> list[dict]:
     """
-    Field-aware vector search. Builds a targeted query string per extracted
-    field so restaurant names match against restaurant names and menu items
-    match against menu items, rather than competing in a single combined search.
+    Field-aware vector search using separate embedding columns per field.
+    - Single field: searches its dedicated embedding column directly.
+    - Multiple fields: runs a separate query per field, averages similarity
+      scores across results, and re-ranks.
     """
     restaurant_raw = extracted.get("restaurant_name")
     menu_item_raw  = extracted.get("menu_item")
     cuisine_raw    = extracted.get("cuisine")
 
-    query_parts = []
+    fields = {}
+    
     if restaurant_raw:
-        query_parts.append(f"Restaurant Name: {restaurant_raw}")
-    if cuisine_raw:
-        query_parts.append(f"Cuisine: {cuisine_raw}")
+        fields["restaurant_name"] = ("restaurant_name_embedding", embed(restaurant_raw))
     if menu_item_raw:
-        query_parts.append(f"Menu Item: {menu_item_raw}")
+        fields["menu_item"] = ("food_item_embedding", embed(menu_item_raw))
+    if cuisine_raw:
+        fields["cuisine"] = ("cuisine_embedding", embed(cuisine_raw))
 
-    targeted_query = ". ".join(query_parts) if query_parts else ""
-
-    if not targeted_query:
+    if not fields:
         return []
-
-    query_vec = embed(targeted_query)
 
     conn = psycopg2.connect(**DB_CONFIG)
     cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    cursor.execute(
-        """
-        SELECT *,
-            1.0 - (embedding <=> %s::vector) AS similarity
-        FROM restaurant_embeddings
-        ORDER BY similarity DESC
-        LIMIT %s
-        """,
-        (query_vec, limit)
-    )
+    # Single field
+    if len(fields) == 1:
+        col, query_vec = next(iter(fields.values()))
+
+        cursor.execute(
+            f"""
+            SELECT *,
+                1.0 - ({col} <=> %s::vector) AS similarity
+            FROM restaurant_embeddings
+            ORDER BY similarity DESC
+            LIMIT %s
+            """,
+            (query_vec, limit)
+        )
+
+        results = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        return results
+
+    # Multiple fields
+    scores = {}   # menu_item_id -> {row, total_similarity, field_count}
+
+    for field_name, (col, query_vec) in fields.items():
+        cursor.execute(
+            f"""
+            SELECT *,
+                1.0 - ({col} <=> %s::vector) AS similarity
+            FROM restaurant_embeddings
+            ORDER BY similarity DESC
+            LIMIT %s
+            """,
+            (query_vec, limit * 3)
+        )
+        rows = cursor.fetchall()
+
+        for row in rows:
+            mid = row["menu_item_id"]
+            if mid not in scores:
+                scores[mid] = {"row": row, "total_similarity": 0.0, "field_count": 0}
+            scores[mid]["total_similarity"] += row["similarity"]
+            scores[mid]["field_count"] += 1
     
-    results = cursor.fetchall()
     cursor.close()
     conn.close()
 
-    return results
+    # Average similarity across all fields that matched this row
+    merged = []
+    for mid, data in scores.items():
+        avg_sim = data["total_similarity"] / len(fields)
+        result_row = dict(data["row"])
+        result_row["similarity"] = round(avg_sim, 10)
+        merged.append(result_row)
+
+    merged.sort(key=lambda x: x["similarity"], reverse=True)
+    return merged[:limit]
 
 
 # Step 4 — Merge: pick the best canonical match for each extracted field
@@ -223,6 +262,9 @@ def extract_and_search(request: UserPromptRequest):
     # Strip embedding vector from matches before returning
     for match in top_matches:
         match.pop("embedding", None)
+        match.pop("restaurant_name_embedding", None)
+        match.pop("food_item_embedding", None)
+        match.pop("cuisine_embedding", None)
 
     return SearchResponse(
         restaurant_name = restaurant_raw,
