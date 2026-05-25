@@ -14,7 +14,7 @@ ENABLE_TRANSLATION = os.getenv("ENABLE_TRANSLATION", "false").strip().lower() in
 # Models are at project root level
 ROOT_DIR = Path(__file__).resolve().parents[2]
 MODEL_PATH = ROOT_DIR / "models" / "STT_whisper_Model"
-QWEN_MODEL_PATH = ROOT_DIR / "models" / "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+QWEN_MODEL_PATH = ROOT_DIR / "models" / "qwen-food-merged.Q4_K_M.gguf"
 
 print(f"Model path: {MODEL_PATH.resolve()}")
 print(f"Exists: {MODEL_PATH.exists()}")
