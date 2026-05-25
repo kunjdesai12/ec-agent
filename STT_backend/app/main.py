@@ -1,7 +1,6 @@
 import asyncio
 from fastapi import FastAPI
-from app.config import STT_BACKEND, HOST, PORT
-from app.models_files.whisper import load_whisper_model
+from app.config import STT_BACKEND
 from app.api.transcribe import router as transcribe_router
 from app.api.transcribe import _worker
 
@@ -16,17 +15,19 @@ app.include_router(transcribe_router)
 
 @app.on_event("startup")
 async def startup():
-    # Start background worker when app starts
     asyncio.create_task(_worker())
     if STT_BACKEND:
+        from app.models_files.whisper import load_whisper_model
         load_whisper_model()
+    else:
+        from app.models_files.sarvam import init_sarvam_client
+        init_sarvam_client()
 
 
 @app.get("/health")
 def health():
     return {
         "status":  "ok",
-        "backend": "local" if STT_BACKEND else "sarvam",
+        "backend": "local_whisper" if STT_BACKEND else "sarvam",
         "queue":   "python_asyncio",
-        "device":  "cpu/mps" if STT_BACKEND else "cloud",
     }

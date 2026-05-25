@@ -12,7 +12,7 @@ SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 ENABLE_TRANSLATION = os.getenv("ENABLE_TRANSLATION", "false").strip().lower() in {"true", "1", "yes"}
 
 # Models are at project root level
-ROOT_DIR = Path(__file__).resolve().parents[1]
+ROOT_DIR = Path(__file__).resolve().parents[2]
 MODEL_PATH = ROOT_DIR / "models" / "STT_whisper_Model"
 QWEN_MODEL_PATH = ROOT_DIR / "models" / "qwen2.5-1.5b-instruct-q4_k_m.gguf"
 

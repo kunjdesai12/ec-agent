@@ -4,43 +4,30 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from app.utils.audio import validate_audio_file, save_temp_file
 from app.config import STT_BACKEND, ENABLE_TRANSLATION
-from app.models_files.whisper import transcribe_local
 import uuid
 
 router = APIRouter(tags=["stt"])
 
-# In-memory store for job results
 _jobs: dict = {}
-
-# Thread pool for running blocking calls
 _executor = ThreadPoolExecutor(max_workers=2)
-
-# Python asyncio queue
 _queue = asyncio.Queue()
+
+# Decide at startup based on .env
+if STT_BACKEND:
+    from app.models_files.whisper import transcribe_local as transcribe_stt
+else:
+    from app.models_files.sarvam import transcribe_sarvam as transcribe_stt
 
 
 async def _worker():
-    """Background worker — runs forever, picks jobs from queue."""
     while True:
         job_id, tmp_path = await _queue.get()
         try:
             _jobs[job_id]["status"] = "processing"
-
             loop = asyncio.get_event_loop()
 
-            # Run blocking STT in thread pool
-            if not STT_BACKEND:
-                from app.models_files.sarvam import transcribe_sarvam
-                result = await loop.run_in_executor(
-                    _executor, transcribe_sarvam, tmp_path
-                )
-            else:
-                from app.models_files.whisper import transcribe_local
-                result = await loop.run_in_executor(
-                    _executor, transcribe_local, tmp_path
-                )
+            result = await loop.run_in_executor(_executor, transcribe_stt, tmp_path)
 
-            # Run blocking translation in thread pool
             if ENABLE_TRANSLATION:
                 from app.models_files.translator import translate_to_english
                 translated = await loop.run_in_executor(
@@ -88,6 +75,6 @@ async def get_status(job_id: str):
     if job["status"] == "completed":
         return {"job_id": job_id, "status": "completed", "result": job["result"]}
     elif job["status"] == "failed":
-        return {"job_id": job_id, "status": "failed",    "error":  job["error"]}
+        return {"job_id": job_id, "status": "failed", "error": job["error"]}
     else:
         return {"job_id": job_id, "status": job["status"]}

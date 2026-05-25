@@ -1,14 +1,14 @@
 import time
 from sarvamai import SarvamAI
-from app.config import SARVAM_API_KEY, STT_BACKEND
+from app.config import SARVAM_API_KEY
 
 sarvam_client = None
 
-if not STT_BACKEND:
+def init_sarvam_client():
+    global sarvam_client
     print(" Initializing Sarvam client...")
     sarvam_client = SarvamAI(api_subscription_key=SARVAM_API_KEY)
     print(" Sarvam client ready")
-
 
 def transcribe_sarvam(audio_path: str) -> dict:
     t_start = time.perf_counter()
