@@ -118,20 +118,20 @@ def upsert_restaurants(cursor, records):
 def upsert_menu_items(cursor, records):
 
     rows = [
-        (r["menu_item_id"], r["business_id"], r["title"], r["cuisine_id"])
+        (r["menu_item_id"], r["business_id"], r["title"], r["cuisines_id"])
         for r in records
     ]
 
     psycopg2.extras.execute_values(
         cursor,
         """
-        INSERT INTO menu_items (menu_item_id, business_id, title, cuisine_id, updated_at)
+        INSERT INTO menu_items (menu_item_id, business_id, title, cuisines_id, updated_at)
         VALUES %s
         ON CONFLICT (menu_item_id)
         DO UPDATE SET
             business_id = EXCLUDED.business_id,
             title       = EXCLUDED.title,
-            cuisine_id  = EXCLUDED.cuisine_id,
+            cuisines_id  = EXCLUDED.cuisines_id,
             updated_at  = NOW()
         """,
         rows,

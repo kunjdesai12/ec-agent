@@ -198,9 +198,16 @@ def search_embeddings(extracted: dict, limit: int = 5) -> list[dict]:
     # Average similarity across all fields that matched this row
     merged = []
     for mid, data in scores.items():
+
         avg_sim = data["total_similarity"] / len(fields)
+
+        if data["field_count"] < len(fields):
+            avg_sim *= 0.7
+
         result_row = dict(data["row"])
+
         result_row["similarity"] = round(avg_sim, 10)
+        
         merged.append(result_row)
 
     merged.sort(key=lambda x: x["similarity"], reverse=True)
@@ -273,6 +280,7 @@ def extract_and_search(request: UserPromptRequest):
         confidence = ConfidenceScores(overall=overall_conf),
         top_matches = top_matches,
     )
+
 
 @app.get("/health")
 async def health():
