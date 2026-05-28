@@ -21,11 +21,11 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 DB_CONFIG = dict(
-    dbname="postgres",
-    user="postgres.eilbullhdgvzgflqzgnq",
-    password="Agent@DB_SUPA",
-    host="aws-1-ap-southeast-1.pooler.supabase.com",
-    port="6543",
+    dbname="vector_easycater",
+    user="postgres",
+    password="Mitesh@123",
+    host="localhost",
+    port="5432",
 )
 
 MODEL_NAME  = "all-MiniLM-L6-v2"
@@ -58,7 +58,11 @@ def fetch_source_rows(cursor, last_synced_at):
             restaurant_name,
             food_item,
             combined_text,
-            cuisines_name
+            cuisines_name,
+            rating,
+            price,
+            latitude,
+            longitude
         FROM restaurant_menu_view
         WHERE updated_at > %s
     """, (last_synced_at,))
@@ -70,7 +74,7 @@ def upsert_batch(cursor, records):
         cursor,
         """
         INSERT INTO restaurant_embeddings
-            (menu_item_id, restaurant_id, restaurant_name, food_item, combined_text, embedding, restaurant_name_embedding, food_item_embedding, cuisine_embedding)
+            (menu_item_id, restaurant_id, restaurant_name, food_item, combined_text, cuisine_name, rating, price, latitude, longitude, embedding, restaurant_name_embedding, food_item_embedding, cuisine_embedding)
         VALUES %s
         ON CONFLICT (menu_item_id)
         DO UPDATE SET
@@ -78,13 +82,18 @@ def upsert_batch(cursor, records):
             restaurant_name = EXCLUDED.restaurant_name,
             food_item       = EXCLUDED.food_item,
             combined_text   = EXCLUDED.combined_text,
+            cuisine_name    = EXCLUDED.cuisine_name,
+            rating          = EXCLUDED.rating,
+            price           = EXCLUDED.price,
+            latitude        = EXCLUDED.latitude,
+            longitude       = EXCLUDED.longitude,
             embedding       = EXCLUDED.embedding,
             restaurant_name_embedding = EXCLUDED.restaurant_name_embedding,
             food_item_embedding       = EXCLUDED.food_item_embedding,
             cuisine_embedding         = EXCLUDED.cuisine_embedding
         """,
         records,
-        template="(%s, %s, %s, %s, %s, %s::vector, %s::vector, %s::vector, %s::vector)",
+        template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector, %s::vector, %s::vector, %s::vector)",
     )
 
 
@@ -149,6 +158,11 @@ def run_sync():
                     row[2],
                     row[3],
                     row[4],
+                    row[5],
+                    row[6],
+                    row[7],
+                    row[8],
+                    row[9],
                     combined_embeddings[j].tolist(),
                     restaurant_name_embeddings[j].tolist(),
                     food_item_embeddings[j].tolist(),

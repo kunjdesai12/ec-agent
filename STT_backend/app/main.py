@@ -1,6 +1,7 @@
 import asyncio
 from fastapi import FastAPI
-from app.config import STT_BACKEND, ENABLE_TRANSLATION
+from app.config import STT_BACKEND, HOST, PORT
+from app.models_files.whisper import load_whisper_model
 from app.api.transcribe import router as transcribe_router
 from app.api.transcribe import _worker
 
