@@ -7,7 +7,9 @@ import psycopg2.extras
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
-LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sync_embeddings.log")
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "sync_embeddings.log")
 
 logging.basicConfig(
     level=logging.INFO,
