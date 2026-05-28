@@ -1,5 +1,7 @@
+from wsgiref import headers
+
 import httpx
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from langchain_core.tools import tool
 from datetime import datetime, timezone
 from pydantic import BaseModel, Field
@@ -9,30 +11,72 @@ BASE_URL = "http://localhost:5610/v1"
 
 # Define Pydantic models for structured input and output data
 
+
 class CustomerDetails(BaseModel):
-    name: str = Field(..., description="Full name of the customer")
-    email: str = Field(..., description="Customer's email address")
-    contact: str = Field(..., description="Customer's phone number")
- 
- 
+    name: str
+    email: str
+    contact: str
+
+
 class DeliveryAddress(BaseModel):
-    address_line_1: str = Field(..., description="Primary street address")
-    city: str = Field(..., description="City name")
-    state: str = Field(..., description="State name")
-    pincode: str = Field(..., description="Postal/ZIP code")
-    latitude: str = Field(..., description="Latitude of delivery location")
-    longitude: str = Field(..., description="Longitude of delivery location")
-    address_id: str = Field(default="", alias="AddressID", description="Optional saved address ID")
- 
+    latitude: str
+    longitude: str
+    address_line_1: str
+    city: str
+    state: str
+    pincode: str
+    AddressID: Optional[str] = "100"
  
 class PlaceOrderInput(BaseModel):
-    restaurant_id: int = Field(..., description="Restaurant ID where the order should be placed")
-    menu_item_ids: List[int] = Field(..., description="List of menu item IDs to order")
-    customer_details: CustomerDetails = Field(..., description="Customer name, email, and contact")
-    delivery_address: DeliveryAddress = Field(..., description="Full delivery address with coordinates")
-    quantity: int = Field(default=1, description="Quantity applied to each menu item")
-    is_cod: bool = Field(default=False, description="Set True to use Cash on Delivery")
-    order_instructions: str = Field(default="", description="Special instructions for the restaurant")
+    restaurant_id: int = Field(
+        ...,
+        description="Restaurant ID where the order should be placed"
+    )
+
+    menu_item_ids: List[int] = Field(
+        ...,
+        description="List of menu item IDs to order"
+    )
+
+    price: float = Field(
+        ...,
+        description="Base price of each menu item"
+    )
+
+    order_type: str = Field(
+        ...,
+        description="delivery / pickup / dinein"
+    )
+
+    customer_details: CustomerDetails = Field(
+        ...,
+        description="Customer name, email, and contact"
+    )
+
+    delivery_address: DeliveryAddress = Field(
+        ...,
+        description="Full delivery address with coordinates"
+    )
+
+    quantity: int = Field(
+        default=1,
+        description="Quantity applied to each menu item"
+    )
+
+    is_cod: bool = Field(
+        default=False,
+        description="Set True to use Cash on Delivery"
+    )
+
+    order_instructions: str = Field(
+        default="",
+        description="Special instructions for the restaurant"
+    )
+
+    jwt_token: str = Field(
+        ...,
+        description="JWT bearer token for authenticated user"
+    )
 
 
 async def fetch_api(
@@ -40,15 +84,24 @@ async def fetch_api(
     method: str = "GET",
     params: Dict = None,
     json: Dict = None,
+    headers: Dict = None,
 ) -> Dict:
 
     async with httpx.AsyncClient(timeout=20.0) as client:
 
         if method.upper() == "GET":
-            response = await client.get(url, params=params)
+            response = await client.get(url, params=params, headers=headers)
 
         elif method.upper() == "POST":
-            response = await client.post(url, json=json)
+            response = await client.post(url, json=json, headers=headers)
+
+        elif method.upper() == "DELETE":
+            response = await client.request(
+                "DELETE",
+                url,
+                json=json,
+                headers=headers
+            )
 
         else:
             raise ValueError(f"Unsupported method: {method}")
@@ -134,29 +187,56 @@ async def search_food_items(query: str) -> List[Dict[str, Any]]:
 
 
 @tool
-async def get_order_status(order_id: int) -> Dict[str, Any]:
-    """Retrieve complete order details and live order status using an order ID.
+async def get_order_status(
+    order_id: int,
+    jwt_token: str,
+) -> Dict[str, Any]:
+    """
+    Retrieve complete order details and live order status using an order ID.
 
-    Useful for checking order progress, payment status, delivery updates,
-    ordered items, restaurant details, tracking information,
-    and customer order history.
+    Useful for:
+    - order progress
+    - payment status
+    - delivery updates
+    - ordered items
+    - restaurant details
+    - tracking information
+    - customer order history
 
     Args:
-        order_id: Unique order ID to fetch order details and status.
-                  Example: 1024
+        order_id: Unique order ID
+        jwt_token: User JWT bearer token
     """
+
     url = f"{BASE_URL}/order/{order_id}"
-    return await fetch_api(url)
+
+    headers = {
+        "Authorization": f"Bearer {jwt_token}"
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+
+        response = await client.get(
+            url,
+            headers=headers
+        )
+
+        response.raise_for_status()
+
+        return response.json()
 
 @tool(args_schema=PlaceOrderInput)
 async def place_order(
     restaurant_id: int,
     menu_item_ids: List[int],
+    price: float,
+    order_type: str,
     customer_details: CustomerDetails,
     delivery_address: DeliveryAddress,
     quantity: int = 1,
     is_cod: bool = False,
     order_instructions: str = "",
+    jwt_token: str = "",
 ) -> Dict[str, Any]:
     """Create a cart and place a food delivery order.
  
@@ -172,43 +252,56 @@ async def place_order(
         is_cod: Whether to use Cash on Delivery. Defaults to False (online payment).
         order_instructions: Optional special instructions for the restaurant.
     """
-    # STEP 1: Build and submit cart
     cart_payload = {
         "restaurants": [
             {
                 "restaurant_id": restaurant_id,
                 "menu_items": [
-                    {"menu_item_id": item_id, "quantity": quantity, "groups": []}
+                    {"menu_item_id": item_id, "quantity": quantity, "baseprice": price, "totalprice": price * quantity, "customizations": []}
                     for item_id in menu_item_ids
                 ],
             }
         ]
     }
-    cart_response = await fetch_api(f"{BASE_URL}/new-cart/add-update", method="POST", json=cart_payload)
+    headers = {
+    "Authorization": f"Bearer {jwt_token}"
+    }
+
+    await fetch_api(
+        f"{BASE_URL}/new-cart/delete-all",
+        method="DELETE",
+        headers=headers
+    )
+    
+    cart_response = await fetch_api(
+        f"{BASE_URL}/new-cart/add-update",
+        method="POST",
+        json=cart_payload,
+        headers=headers
+    )
     cart_data = cart_response.get("data", {})
- 
-    # STEP 2: Extract cart details
-    cart_details = cart_data.get("cart_details") or cart_data.get("cart") or {}
-    cart_id = cart_data.get("cart_id")
- 
-    # STEP 3: Build and submit order
+    cart_details_2 = cart_data.get("cart_details") or cart_data.get("cart") or {}
+
     now_utc = datetime.now(timezone.utc).isoformat()
     order_payload = {
-        "cart_id": cart_id,
-        "cart_details": cart_details,
+        "cart_details": cart_details_2,
         "customer_details": customer_details.model_dump(),
-        "delivery_address": delivery_address.model_dump(by_alias=True),
-        "order_type": "delivery",
+        "delivery_address": delivery_address.model_dump(),
+        "order_type": order_type,
         "apply_coupons": [],
         "order_instructions": order_instructions,
+        "company_id": "",
         "order_time": now_utc,
         "order_placed_time": now_utc,
         "order_tip": 0,
+        "delivery_instructions": "",
         "loyalty_points": 0,
         "dinein_booking_id": None,
         "is_cod": is_cod,
     }
-    order_response = await fetch_api(f"{BASE_URL}/new-payment/create-order", method="POST", json=order_payload)
+    print("Order Payload:", order_payload)
+    order_response = await fetch_api(f"{BASE_URL}/new-payment/create-order", method="POST", json=order_payload, headers=headers)
+    print("Order Response:", order_response)
  
     return {
         "success": True,

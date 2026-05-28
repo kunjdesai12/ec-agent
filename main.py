@@ -19,11 +19,11 @@ app = FastAPI(title="Delivery Agent — Semantic Search API")
 
 # Database config (from sync_raw_data.py)
 DB_CONFIG = dict(
-    dbname="postgres",
-    user="postgres.eilbullhdgvzgflqzgnq",
-    password="Agent@DB_SUPA",
-    host="aws-1-ap-southeast-1.pooler.supabase.com",
-    port="6543",
+    dbname="vector_easycater",
+    user="postgres",
+    password="Mitesh@123",
+    host="localhost",
+    port="5432",
 )
 
 embedder = SentenceTransformer(EMBEDDING_MODEL)
