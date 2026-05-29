@@ -14,10 +14,44 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Optional, List, Dict
+import httpx
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+BASE_URL = os.getenv("TOOL_BASE_URL")
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
+
+class CustomerDetails(BaseModel):
+    name: str
+    email: str
+    contact: str
+
+class DeliveryAddress(BaseModel):
+    latitude: str
+    longitude: str
+    address_line_1: str
+    city: str
+    state: str
+    pincode: str
+    AddressID: Optional[str] = "100"
+ 
+class PlaceOrderInput(BaseModel):
+    restaurant_id: int = Field(..., description="Restaurant ID")
+    menu_item_ids: List[int] = Field(..., description="Menu item IDs")
+    price: float = Field(..., description="Base item price")
+    order_type: str = Field(..., description="delivery / pickup / dinein")
+    customer_details: CustomerDetails
+    delivery_address: DeliveryAddress
+    quantity: int = Field(1, description="Quantity per item")
+    is_cod: bool = Field(False, description="Cash on Delivery")
+    order_instructions: str = Field("", description="Special instructions")
+    jwt_token: str = Field(..., description="JWT bearer token")
 
 # ────────────────────────────────────────────────────────────────────────────
 # Schemas (OpenAI-compatible function schema — vLLM converts to Hermes format)
@@ -87,51 +121,149 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "place_order",
             "description": (
-                "Place a confirmed food order. Call ONLY after confirming items, quantities, "
-                "and delivery address with the user. Returns order_id and ETA."
+                "Create a food delivery order by creating/updating the cart, "
+                "calculating totals, and generating the final order."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "restaurant_id": {"type": "string"},
-                    "items": {
+                    "restaurant_id": {
+                        "type": "integer",
+                        "description": "Unique restaurant ID where the order should be placed."
+                    },
+                    "menu_item_ids": {
                         "type": "array",
                         "items": {
-                            "type": "object",
-                            "properties": {
-                                "item_id": {"type": "string"},
-                                "name": {"type": "string"},
-                                "quantity": {"type": "integer", "minimum": 1},
-                                "modifiers": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "description": "e.g. ['no onion', 'extra spicy']",
-                                },
-                            },
-                            "required": ["item_id", "name", "quantity"],
+                            "type": "integer"
                         },
+                        "description": "List of menu item IDs selected by the customer."
                     },
-                    "delivery_address_id": {"type": "string"},
-                    "payment_method": {
+                    "price": {
+                        "type": "number",
+                        "description": "Base price of each menu item."
+                    },
+                    "order_type": {
                         "type": "string",
-                        "enum": ["upi", "card", "cod", "wallet"],
+                        "enum": ["delivery", "pickup", "dinein"],
+                        "description": "Type of order being placed."
                     },
+                    "customer_details": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Customer full name."
+                            },
+                            "email": {
+                                "type": "string",
+                                "description": "Customer email address."
+                            },
+                            "phone": {
+                                "type": "string",
+                                "description": "Customer contact number."
+                            }
+                        },
+                        "required": ["name", "email", "phone"]
+                    },
+                    "delivery_address": {
+                        "type": "object",
+                        "properties": {
+                            "address_line_1": {
+                                "type": "string",
+                                "description": "Primary delivery address line."
+                            },
+                            "address_line_2": {
+                                "type": "string",
+                                "description": "Secondary delivery address line."
+                            },
+                            "landmark": {
+                                "type": "string",
+                                "description": "Nearby landmark for easy navigation."
+                            },
+                            "city": {
+                                "type": "string",
+                                "description": "City name."
+                            },
+                            "state": {
+                                "type": "string",
+                                "description": "State name."
+                            },
+                            "pincode": {
+                                "type": "string",
+                                "description": "Postal or ZIP code."
+                            },
+                            "latitude": {
+                                "type": "number",
+                                "description": "Latitude coordinate."
+                            },
+                            "longitude": {
+                                "type": "number",
+                                "description": "Longitude coordinate."
+                            }
+                        },
+                        "required": [
+                            "address_line_1",
+                            "city",
+                            "state",
+                            "pincode",
+                            "latitude",
+                            "longitude"
+                        ]
+                    },
+                    "quantity": {
+                        "type": "integer",
+                        "description": "Quantity applied uniformly to each menu item.",
+                        "default": 1
+                    },
+                    "is_cod": {
+                        "type": "boolean",
+                        "description": "Whether payment mode is Cash on Delivery.",
+                        "default": False
+                    },
+                    "order_instructions": {
+                        "type": "string",
+                        "description": "Special cooking or delivery instructions."
+                    },
+                    "jwt_token": {
+                        "type": "string",
+                        "description": "JWT access token for authenticated API requests."
+                    }
                 },
-                "required": ["restaurant_id", "items", "delivery_address_id", "payment_method"],
-            },
-        },
+                "required": [
+                    "restaurant_id",
+                    "menu_item_ids",
+                    "price",
+                    "order_type",
+                    "customer_details",
+                    "delivery_address",
+                    "jwt_token"
+                ]
+            }
+        }
     },
     {
         "type": "function",
         "function": {
             "name": "get_order_status",
-            "description": "Check the status of an existing order by order_id.",
+            "description": (
+                "Retrieve complete order details and live order status "
+                "including payment, delivery, tracking, and restaurant information."
+            ),
             "parameters": {
                 "type": "object",
-                "properties": {"order_id": {"type": "string"}},
-                "required": ["order_id"],
-            },
-        },
+                "properties": {
+                    "order_id": {
+                        "type": "integer",
+                        "description": "Unique order ID"
+                    },
+                    "jwt_token": {
+                        "type": "string",
+                        "description": "JWT bearer token for authenticated user"
+                    }
+                },
+                "required": ["order_id", "jwt_token"]
+            }
+        }
     },
     {
         "type": "function",
@@ -163,6 +295,38 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 # Mock handlers — replace bodies with real microservice calls later
 # ────────────────────────────────────────────────────────────────────────────
 
+async def fetch_api(
+    url: str,
+    method: str = "GET",
+    params: Dict = None,
+    json: Dict = None,
+    headers: Dict = None,
+) -> Dict:
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+
+        if method.upper() == "GET":
+            response = await client.get(url, params=params, headers=headers)
+
+        elif method.upper() == "POST":
+            response = await client.post(url, json=json, headers=headers)
+
+        elif method.upper() == "DELETE":
+            response = await client.request(
+                "DELETE",
+                url,
+                json=json,
+                headers=headers
+            )
+
+        else:
+            raise ValueError(f"Unsupported method: {method}")
+
+        response.raise_for_status()
+
+        return response.json()
+    
+    
 async def _search_food(args: dict[str, Any]) -> dict[str, Any]:
     query = args.get("query", "")
     return {
@@ -212,26 +376,122 @@ async def _get_restaurant_details(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _place_order(args: dict[str, Any]) -> dict[str, Any]:
-    order_id = f"ord_{uuid.uuid4().hex[:10]}"
-    total = sum(it.get("quantity", 1) * 280 for it in args.get("items", []))
+async def _place_order(
+    restaurant_id: int,
+    menu_item_ids: List[int],
+    price: float,
+    order_type: str,
+    customer_details: CustomerDetails,
+    delivery_address: DeliveryAddress,
+    quantity: int = 1,
+    is_cod: bool = False,
+    order_instructions: str = "",
+    jwt_token: str = "",
+) -> Dict[str, Any]:
+    """Create a cart and place a food delivery order.
+ 
+    Handles the full order lifecycle — cart creation, pricing, taxes,
+    delivery fees, and order generation — in a single call.
+ 
+    Args:
+        restaurant_id: Restaurant ID where the order should be placed.
+        menu_item_ids: List of menu item IDs to order.
+        customer_details: Customer name, email, and contact number.
+        delivery_address: Full delivery address including coordinates and pincode.
+        quantity: Quantity applied uniformly to each menu item. Defaults to 1.
+        is_cod: Whether to use Cash on Delivery. Defaults to False (online payment).
+        order_instructions: Optional special instructions for the restaurant.
+    """
+    cart_payload = {
+        "restaurants": [
+            {
+                "restaurant_id": restaurant_id,
+                "menu_items": [
+                    {"menu_item_id": item_id, "quantity": quantity, "baseprice": price, "totalprice": price * quantity, "customizations": []}
+                    for item_id in menu_item_ids
+                ],
+            }
+        ]
+    }
+    headers = {
+    "Authorization": f"Bearer {jwt_token}"
+    }
+    
+    cart_response = await fetch_api(
+        f"{BASE_URL}/new-cart/add-update",
+        method="POST",
+        json=cart_payload,
+        headers=headers
+    )
+    cart_data = cart_response.get("data", {})
+    cart_details = cart_data.get("cart_details") or cart_data.get("cart") or {}
+
+    now_utc = datetime.now(timezone.utc).isoformat()
+    order_payload = {
+        "cart_details": cart_details,
+        "customer_details": customer_details.model_dump(),
+        "delivery_address": delivery_address.model_dump(),
+        "order_type": order_type,
+        "apply_coupons": [],
+        "order_instructions": order_instructions,
+        "company_id": "",
+        "order_time": now_utc,
+        "order_placed_time": now_utc,
+        "order_tip": 0,
+        "delivery_instructions": "",
+        "loyalty_points": 0,
+        "dinein_booking_id": None,
+        "is_cod": is_cod,
+    }
+    print("Order Payload:", order_payload)
+    order_response = await fetch_api(f"{BASE_URL}/new-payment/create-order", method="POST", json=order_payload, headers=headers)
+    print("Order Response:", order_response)
+ 
     return {
-        "order_id": order_id,
-        "status": "confirmed",
-        "eta_minutes": 35,
-        "total_inr": total,
-        "placed_at": datetime.now(timezone.utc).isoformat(),
+        "success": True,
+        "cart_response": cart_response,
+        "order_response": order_response,
     }
 
 
-async def _get_order_status(args: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "order_id": args["order_id"],
-        "status": "out_for_delivery",
-        "eta_minutes": 8,
-        "rider_name": "Ramesh",
+async def _get_order_status(
+    order_id: int,
+    jwt_token: str,
+) -> Dict[str, Any]:
+    """
+    Retrieve complete order details and live order status using an order ID.
+
+    Useful for:
+    - order progress
+    - payment status
+    - delivery updates
+    - ordered items
+    - restaurant details
+    - tracking information
+    - customer order history
+
+    Args:
+        order_id: Unique order ID
+        jwt_token: User JWT bearer token
+    """
+
+    url = f"{BASE_URL}/order/{order_id}"
+
+    headers = {
+        "Authorization": f"Bearer {jwt_token}"
     }
 
+    async with httpx.AsyncClient(timeout=30.0) as client:
+
+        response = await client.get(
+            url,
+            headers=headers
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+    
 
 async def _cancel_order(args: dict[str, Any]) -> dict[str, Any]:
     return {"order_id": args["order_id"], "status": "cancelled", "refund_initiated": True}
