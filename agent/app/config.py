@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     # Tool loop
     max_tool_iterations: int = 5
 
+    # Semantic search url
+    semantic_search_url = "http://localhost:8000"
 
 @lru_cache
 def get_settings() -> Settings:

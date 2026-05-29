@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import json
 import uuid
+import httpx
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional, List, Dict
 import httpx
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import os
+from agent.app.config import get_settings
 
 load_dotenv()
 
@@ -329,29 +331,52 @@ async def fetch_api(
     
 async def _search_food(args: dict[str, Any]) -> dict[str, Any]:
     query = args.get("query", "")
-    return {
-        "results": [
-            {
-                "restaurant_id": "rest_042",
-                "restaurant_name": "Saffron Kitchen",
-                "item_id": "itm_1021",
-                "item_name": "Butter Chicken",
-                "price": 320,
-                "cuisine": "north-indian",
-                "rating": 4.4,
-                "match_reason": f"matches query '{query}'",
-            },
-            {
-                "restaurant_id": "rest_088",
-                "restaurant_name": "Tandoor Tales",
-                "item_id": "itm_2210",
-                "item_name": "Paneer Tikka Masala",
-                "price": 280,
-                "cuisine": "north-indian",
-                "rating": 4.2,
-            },
-        ]
+    cuisine = args.get("cuisine")
+    max_price = args.get("max_price")
+
+    # Parse query into fields — single field goes as menu_item
+    # unless it clearly looks like a restaurant name (handled by LLM upstream)
+    payload = {
+        "menu_item":    query,
+        "cuisine":      cuisine,
+        "max_price":    max_price,
+        "limit":        5,
     }
+
+    settings = get_settings()
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{settings.semantic_search_url}/search",
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+    except httpx.HTTPError as e:
+        return {"error": f"Semantic search unavailable: {e}"}
+
+    top_matches = data.get("top_matches", [])
+
+    if not top_matches:
+        return {"results": [], "message": "No matches found"}
+
+    # Shape results for the LLM
+    results = [
+        {
+            "restaurant_id":   match.get("restaurant_id"),
+            "restaurant_name": match.get("restaurant_name"),
+            "item_id":         match.get("menu_item_id"),
+            "item_name":       match.get("food_item"),
+            "price":           match.get("price"),
+            "cuisine":         match.get("cuisine_name"),
+            "rating":          match.get("rating"),
+            "confidence":      match.get("similarity"),
+        }
+        for match in top_matches
+    ]
+
+    return {"results": results}
 
 
 async def _get_menu(args: dict[str, Any]) -> dict[str, Any]:

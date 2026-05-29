@@ -42,6 +42,12 @@ class SearchResponse(BaseModel):
     confidence: ConfidenceScores
     top_matches: list[dict]
 
+class StructuredSearchRequest(BaseModel):
+    restaurant_name: str | None = None
+    menu_item: str | None = None
+    cuisine: str | None = None
+    max_price: float | None = None
+    limit: int = 5
 
 # Step 1 — Entity extraction
 EXTRACTION_SYSTEM_PROMPT = """
@@ -281,6 +287,46 @@ def extract_and_search(request: UserPromptRequest):
         top_matches = top_matches,
     )
 
+
+@app.post("/search")
+def structured_search(request: StructuredSearchRequest):
+    """
+    Bypasses entity extraction — accepts already-structured fields
+    and runs vector search directly. Used by the agent's search_food tool.
+    """
+    extracted = {
+        "restaurant_name": request.restaurant_name,
+        "menu_item":       request.menu_item,
+        "cuisine":         request.cuisine,
+    }
+
+    k = get_top_k(extracted)
+    top_matches = search_embeddings(extracted, limit=k)
+
+    # Apply max_price post-filter if provided
+    if request.max_price is not None:
+        top_matches = [
+            m for m in top_matches
+            if m.get("price") is None or float(m.get("price", 0)) <= request.max_price
+        ]
+
+    # Strip embedding vectors
+    for match in top_matches:
+        match.pop("embedding", None)
+        match.pop("restaurant_name_embedding", None)
+        match.pop("food_item_embedding", None)
+        match.pop("cuisine_embedding", None)
+
+    best = top_matches[0] if top_matches else {}
+    overall_conf = round(best.get("similarity", 0.0), 4) if best else None
+
+    return SearchResponse(
+        restaurant_name = request.restaurant_name,
+        menu_item       = request.menu_item,
+        cuisine         = request.cuisine,
+        confidence      = ConfidenceScores(overall=overall_conf),
+        top_matches     = top_matches,
+    )
 
 @app.get("/health")
 async def health():
