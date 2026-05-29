@@ -1,6 +1,6 @@
 import os
 from llama_cpp import Llama
-from app.config import QWEN_MODEL_PATH, ENABLE_TRANSLATION
+from agent.app.config import QWEN_MODEL_PATH, ENABLE_TRANSLATION
 
 translator_model = None
 

@@ -4,7 +4,7 @@ import numpy as np
 import librosa
 from pathlib import Path
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
-from app.config import MODEL_PATH, LANGUAGE, TASK, SAMPLING_RATE, STT_BACKEND
+from agent.app.config import MODEL_PATH, LANGUAGE, TASK, SAMPLING_RATE, STT_BACKEND
 
 processor = None
 model = None

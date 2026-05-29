@@ -3,7 +3,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from app.utils.audio import validate_audio_file, save_temp_file
-from app.config import STT_BACKEND, ENABLE_TRANSLATION
+from agent.app.config import STT_BACKEND, ENABLE_TRANSLATION
 import uuid
 
 router = APIRouter(tags=["stt"])

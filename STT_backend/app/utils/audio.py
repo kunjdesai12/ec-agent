@@ -2,7 +2,7 @@ import os
 import tempfile
 from fastapi import HTTPException
 
-from app.config import SUPPORTED_EXT
+from agent.app.config import SUPPORTED_EXT
 
 def validate_audio_file(filename: str):
     ext = os.path.splitext(filename)[1].lower()

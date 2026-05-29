@@ -1,0 +1,40 @@
+"""Centralized configuration loaded from environment variables."""
+from functools import lru_cache
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    # API
+    api_host: str = "0.0.0.0"
+    api_port: int = 8000
+    log_level: str = "INFO"
+
+    # vLLM upstream (OpenAI-compatible)
+    vllm_base_url: str = "http://localhost:8001/v1"
+    vllm_api_key: str = "EMPTY"  # vLLM ignores but openai client requires
+    vllm_model: str = "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4"
+    vllm_request_timeout_s: float = 60.0
+
+    # Generation
+    max_new_tokens: int = 400
+    temperature: float = 0.3
+    top_p: float = 0.9
+
+    # Valkey/Redis
+    redis_url: str = "redis://valkey:6379/0"
+    history_ttl_s: int = 60 * 60 * 6  # 6h
+    history_max_turns: int = 12
+
+    # RAG
+    embedding_model: str = "BAAI/bge-m3"
+    rag_top_k: int = 5
+
+    # Tool loop
+    max_tool_iterations: int = 5
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()

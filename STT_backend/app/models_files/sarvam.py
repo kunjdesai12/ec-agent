@@ -1,6 +1,6 @@
 import time
 from sarvamai import SarvamAI
-from app.config import SARVAM_API_KEY
+from agent.app.config import SARVAM_API_KEY
 
 sarvam_client = None
 
