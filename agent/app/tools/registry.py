@@ -100,7 +100,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "restaurant_id": {
                     "type": "string",
                     "description": "The unique ID of the restaurant (e.g. '30', '25')"
-                }
+                },
             },
             "required": ["restaurant_id"],
         },
@@ -117,11 +117,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "restaurant_id": {
                     "type": "string",
                     "description": "The unique ID of the restaurant (e.g. '25', '30')"
-                }
+                },
             },
             "required": ["restaurant_id"]
-        }
-    }
+        },
+    },
     },
     {
         "type": "function",
