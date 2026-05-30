@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from wsgiref import headers
 import httpx
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional, List, Dict
@@ -91,32 +92,36 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "get_menu",
-            "description": "Fetch the full menu for a specific restaurant by restaurant_id.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "restaurant_id": {"type": "string"},
-                    "category": {
-                        "type": "string",
-                        "description": "Optional category filter, e.g. 'starters', 'mains', 'desserts'",
-                    },
-                },
-                "required": ["restaurant_id"],
+        "name": "get_menu",
+        "description": "Fetch the complete menu of a restaurant by restaurant_id. Returns clean list of menu items with item_id, name, price, category, description and image.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "restaurant_id": {
+                    "type": "string",
+                    "description": "The unique ID of the restaurant (e.g. '30', '25')"
+                }
             },
+            "required": ["restaurant_id"],
         },
     },
+    },  
     {
         "type": "function",
         "function": {
-            "name": "get_restaurant_details",
-            "description": "Get details about a specific restaurant: hours, rating, delivery time, address.",
-            "parameters": {
-                "type": "object",
-                "properties": {"restaurant_id": {"type": "string"}},
-                "required": ["restaurant_id"],
+        "name": "get_restaurant_details",
+        "description": "Get professional restaurant details including name, address, rating, cuisines and operating hours.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "restaurant_id": {
+                    "type": "string",
+                    "description": "The unique ID of the restaurant (e.g. '25', '30')"
+                }
             },
-        },
+            "required": ["restaurant_id"]
+        }
+    }
     },
     {
         "type": "function",
@@ -380,25 +385,158 @@ async def _search_food(args: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _get_menu(args: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "restaurant_id": args["restaurant_id"],
-        "menu": [
-            {"item_id": "itm_1021", "name": "Butter Chicken", "price": 320, "category": "mains"},
-            {"item_id": "itm_1022", "name": "Garlic Naan", "price": 60, "category": "breads"},
-            {"item_id": "itm_1023", "name": "Gulab Jamun (2 pc)", "price": 90, "category": "desserts"},
-        ],
+    """
+    Final Production Version - Clean menu with only restaurant_id
+    """
+    restaurant_id = args.get("restaurant_id")
+    
+    if not restaurant_id:
+        return {
+            "error": "restaurant_id is required",
+            "status": "failed"
+        }
+
+    params = {
+        "restaurantId": restaurant_id,
+        "listing_type": "instant"
     }
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            response = await client.get(
+                f"{BASE_URL}/new-menu-item/getMenuItemsForUserByRestaurantId",
+                params=params,
+                headers=headers
+            )
+            
+            response.raise_for_status()
+            data = response.json()
+
+            menu_data = data.get("data", {})
+            raw_items = menu_data.get("menuItems", [])
+            categories = menu_data.get("menuCategories", [])
+
+            # Category mapping
+            category_map = {
+                cat.get("menu_category_id"): cat.get("category_name", "Uncategorized")
+                for cat in categories
+            }
+
+            # Clean menu items
+            cleaned_menu = []
+            for item in raw_items[:100]:
+                cleaned_menu.append({
+                    "item_id": str(item.get("menu_item_id")),
+                    "name": item.get("title", "Unknown Item"),
+                    "price": float(item.get("price") or 0),
+                    "category": category_map.get(item.get("menu_category_id"), "Uncategorized"),
+                    "description": item.get("description", ""),
+                    "image_url": item.get("image_url")
+                })
+
+            return {
+                "restaurant_id": restaurant_id,
+                "menu": cleaned_menu,
+                "total_items": len(cleaned_menu),
+                "success": True
+            }
+
+        except httpx.HTTPStatusError as e:
+            return {
+                "error": f"API Error: {e.response.status_code}",
+                "status": "failed"
+            }
+        except Exception as e:
+            return {
+                "error": f"Failed to fetch menu: {str(e)}",
+                "status": "failed"
+            }
 
 
 async def _get_restaurant_details(args: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "restaurant_id": args["restaurant_id"],
-        "name": "Saffron Kitchen",
-        "rating": 4.4,
-        "hours": "11:00 – 23:00",
-        "delivery_eta_minutes": 35,
-        "address": "Alkapuri, Vadodara",
-    }
+    """
+    Professional version: Returns real restaurant details from API.
+    """
+    restaurant_id = args.get("restaurant_id")
+    
+    if not restaurant_id:
+        return {"error": "restaurant_id is required", "status": "failed"}
+
+    params = {"restaurantId": restaurant_id}
+
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        try:
+            response = await client.get(
+                f"{BASE_URL}/new-menu-item/getMenuItemsForUserByRestaurantId",
+                params=params,
+                headers=headers
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            restaurant = data.get("data", {}).get("restaurantDetails", {})
+            operating_hours = restaurant.get("operating_hours", {})
+
+            # Current time in IST
+            from datetime import datetime, timezone, timedelta
+            IST = timezone(timedelta(hours=5, minutes=30))
+            now = datetime.now(IST)
+            current_day = now.strftime("%A").lower()      # e.g. "saturday"
+            current_time = now.strftime("%H:%M")          # e.g. "14:30"
+
+            # Build per-day display + check if open right now
+            hours_list = []
+            is_currently_open = False
+
+            for day, info in operating_hours.items():
+                if not info.get("isOpen"):
+                    continue
+
+                slots = info.get("hours", [])
+                if not slots:
+                    continue
+
+                # Handle ALL slots, not just first
+                slot_strings = []
+                for slot in slots:
+                    start = slot.get("start_time", "")[:5]
+                    end = slot.get("end_time", "")[:5]
+                    slot_strings.append(f"{start}-{end}")
+
+                    # Check if currently open (handles overnight like 07:30-00:30)
+                    if day == current_day:
+                        if end < start:
+                            # Overnight slot — open if after start OR before end
+                            if current_time >= start or current_time <= end:
+                                is_currently_open = True
+                        else:
+                            if start <= current_time <= end:
+                                is_currently_open = True
+
+                hours_list.append(f"{day.capitalize()}: {' & '.join(slot_strings)}")
+
+            hours_display = " | ".join(hours_list) if hours_list else None
+
+            return {
+                "restaurant_id": restaurant_id,
+                "name": restaurant.get("restaurant_name"),
+                "rating": restaurant.get("rating") or restaurant.get("catering_rating"),
+                "address": restaurant.get("address"),
+                "city": restaurant.get("city"),
+                "state": restaurant.get("state"),
+                "cuisines": data.get("data", {}).get("restaurantCuisines", []),
+                "operating_hours": hours_display,
+                "raw_operating_hours": operating_hours,
+                "is_currently_open": is_currently_open,
+                "status": restaurant.get("status"),
+                "success": True
+            }
+
+        except httpx.HTTPStatusError as e:
+            return {"error": f"API Error: {e.response.status_code}", "status": "failed"}
+        except Exception as e:
+            return {"error": f"Failed to fetch restaurant details: {str(e)}", "status": "failed"}
+
 
 
 async def _place_order(
