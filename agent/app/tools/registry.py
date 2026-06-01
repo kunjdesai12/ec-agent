@@ -900,6 +900,7 @@ HANDLERS: dict[str, ToolHandler] = {
     "get_restaurant_details": _get_restaurant_details,
     "place_order": _place_order,
     "get_order_status": _get_order_status,
+    "get_active_orders": _get_active_orders,
     "cancel_order": _cancel_order,
     "get_user_addresses": _get_user_addresses,
 }
