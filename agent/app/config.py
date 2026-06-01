@@ -35,7 +35,15 @@ class Settings(BaseSettings):
     max_tool_iterations: int = 5
 
     # Semantic search url
-    semantic_search_url = "http://localhost:8000"
+    semantic_search_url: str = "http://localhost:8000"
+
+    # pgvector (RDS Postgres — vector store)
+    pg_host: str = "easycater-vector-db.cngqs42w0l3u.ap-south-1.rds.amazonaws.com"
+    pg_port: int = 5432
+    pg_db: str = "easycater_vectors"
+    pg_user: str = "vectoradmin"
+    pg_password: str = ""  # set via PG_PASSWORD env var or .env
+
 
 @lru_cache
 def get_settings() -> Settings:
