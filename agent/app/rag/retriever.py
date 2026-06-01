@@ -1,10 +1,12 @@
-"""bge-m3 retriever for menu items / restaurants / cuisine descriptions.
+"""bge-m3 retriever backed by pgvector (RDS Postgres).
 
-Currently uses an in-memory corpus + cosine similarity for development.
-Production swap-in: pgvector (you already use Postgres/PostGIS) or Qdrant.
+Replaces the in-memory numpy corpus with a Postgres vector search.
+The search_menu() SQL function handles:
+  - cosine similarity via pgvector <=> operator
+  - cuisine / price / geo-distance filters
+  - top-k ranking
 
-Chunk strategy (per your design):
-  one chunk per menu item, prefixed with restaurant + cuisine context.
+All heavy lifting stays in Postgres — no embeddings loaded into RAM.
 """
 from __future__ import annotations
 
@@ -12,7 +14,8 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-import numpy as np
+import psycopg2
+import psycopg2.extras
 from sentence_transformers import SentenceTransformer
 
 from agent.app.config import get_settings
@@ -23,69 +26,54 @@ log = get_logger(__name__)
 
 @dataclass
 class MenuChunk:
-    chunk_id: str
-    restaurant_id: str
+    chunk_id:       str
+    restaurant_id:  str
     restaurant_name: str
-    cuisine: str
-    item_id: str
-    item_name: str
-    price: float
-    text: str  # the embedded text
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
-# Tiny seed corpus for development — replace with a real index in prod
-_SEED_CORPUS: list[MenuChunk] = [
-    MenuChunk(
-        chunk_id="c1", restaurant_id="rest_042", restaurant_name="Saffron Kitchen",
-        cuisine="north-indian", item_id="itm_1021", item_name="Butter Chicken", price=320,
-        text="Saffron Kitchen [north-indian]: Butter Chicken — tandoor-grilled chicken in a creamy tomato-butter gravy. Rich, mildly spiced, served with garlic naan.",
-    ),
-    MenuChunk(
-        chunk_id="c2", restaurant_id="rest_042", restaurant_name="Saffron Kitchen",
-        cuisine="north-indian", item_id="itm_1024", item_name="Dal Makhani", price=240,
-        text="Saffron Kitchen [north-indian]: Dal Makhani — slow-cooked black lentils with cream and butter. Vegetarian, hearty.",
-    ),
-    MenuChunk(
-        chunk_id="c3", restaurant_id="rest_088", restaurant_name="Tandoor Tales",
-        cuisine="north-indian", item_id="itm_2210", item_name="Paneer Tikka Masala", price=280,
-        text="Tandoor Tales [north-indian]: Paneer Tikka Masala — char-grilled cottage cheese in spiced onion-tomato gravy. Vegetarian.",
-    ),
-    MenuChunk(
-        chunk_id="c4", restaurant_id="rest_201", restaurant_name="Coastal Curry",
-        cuisine="south-indian", item_id="itm_3301", item_name="Chicken Chettinad", price=340,
-        text="Coastal Curry [south-indian]: Chicken Chettinad — Tamil Nadu style chicken in roasted spice gravy. Very spicy, peppery.",
-    ),
-    MenuChunk(
-        chunk_id="c5", restaurant_id="rest_201", restaurant_name="Coastal Curry",
-        cuisine="south-indian", item_id="itm_3305", item_name="Masala Dosa", price=140,
-        text="Coastal Curry [south-indian]: Masala Dosa — crisp rice-lentil crepe with spiced potato filling. Vegetarian, served with sambar and coconut chutney.",
-    ),
-    MenuChunk(
-        chunk_id="c6", restaurant_id="rest_310", restaurant_name="Biryani Junction",
-        cuisine="hyderabadi", item_id="itm_4401", item_name="Hyderabadi Chicken Biryani", price=360,
-        text="Biryani Junction [hyderabadi]: Hyderabadi Chicken Biryani — basmati rice layered with marinated chicken, saffron, fried onions. Slow-cooked dum style.",
-    ),
-]
+    cuisine:        str
+    item_id:        str
+    item_name:      str
+    price:          float
+    text:           str          # combined_text from DB
+    description:    str = ""
+    rating:         Optional[float] = None
+    latitude:       Optional[float] = None
+    longitude:      Optional[float] = None
+    metadata:       dict[str, Any] = field(default_factory=dict)
 
 
 class Retriever:
-    """bge-m3 cosine retriever. Embeddings normalized so dot product = cosine."""
+    """pgvector-backed bge-m3 retriever."""
 
     def __init__(self) -> None:
         s = get_settings()
         log.info("loading_embedding_model", extra={"model": s.embedding_model})
-        # bge-m3 dims = 1024
         self.model = SentenceTransformer(s.embedding_model)
         self.top_k = s.rag_top_k
-        self.corpus: list[MenuChunk] = list(_SEED_CORPUS)
-        self.embeddings: np.ndarray = self._embed_corpus()
-        log.info("retriever_ready", extra={"n_chunks": len(self.corpus)})
+        self._pg_conn_str = (
+            f"host={s.pg_host} "
+            f"dbname={s.pg_db} "
+            f"user={s.pg_user} "
+            f"password={s.pg_password} "
+            f"port={s.pg_port}"
+        )
+        # Verify connection at startup
+        self._check_connection()
+        log.info("retriever_ready", extra={"backend": "pgvector"})
 
-    def _embed_corpus(self) -> np.ndarray:
-        texts = [c.text for c in self.corpus]
-        emb = self.model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
-        return emb
+    def _check_connection(self) -> None:
+        try:
+            conn = psycopg2.connect(self._pg_conn_str)
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM menu_embeddings")
+                count = cur.fetchone()[0]
+            conn.close()
+            log.info("pgvector_connected", extra={"menu_embeddings_count": count})
+        except Exception as e:
+            log.error("pgvector_connection_failed", extra={"error": str(e)})
+            raise
+
+    def _get_conn(self):
+        return psycopg2.connect(self._pg_conn_str)
 
     async def search(
         self,
@@ -94,29 +82,120 @@ class Retriever:
         top_k: Optional[int] = None,
         cuisine: Optional[str] = None,
         max_price: Optional[float] = None,
+        user_lat: Optional[float] = None,
+        user_lon: Optional[float] = None,
+        max_distance_km: Optional[float] = 10.0,
     ) -> list[MenuChunk]:
-        """Embed query, score against corpus, apply metadata filters, return top-k."""
+        """
+        Embed query and search pgvector for similar menu items.
+        Filters: cuisine, max_price, geo-distance (optional).
+        """
         k = top_k or self.top_k
-        # encode is CPU-bound; run in thread to avoid blocking the event loop
+
+        # Embed query — CPU bound, run in thread
         q_emb = await asyncio.to_thread(
-            self.model.encode, [query], normalize_embeddings=True, convert_to_numpy=True
+            self.model.encode,
+            [query],
+            normalize_embeddings=True,
+            convert_to_numpy=True,
         )
-        scores = (self.embeddings @ q_emb[0])  # cosine since both normalized
 
-        # Apply filters
-        candidates: list[tuple[float, MenuChunk]] = []
-        for score, chunk in zip(scores, self.corpus):
-            if cuisine and chunk.cuisine != cuisine:
-                continue
-            if max_price is not None and chunk.price > max_price:
-                continue
-            candidates.append((float(score), chunk))
+        # Format embedding as Postgres vector string
+        emb_str = "[" + ",".join(f"{v:.6f}" for v in q_emb[0].tolist()) + "]"
 
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return [c for _, c in candidates[:k]]
+        # Run DB query in thread to avoid blocking event loop
+        results = await asyncio.to_thread(
+            self._query_pgvector,
+            emb_str, cuisine, max_price,
+            user_lat, user_lon, max_distance_km, k
+        )
+        return results
+
+    def _query_pgvector(
+        self,
+        emb_str: str,
+        cuisine: Optional[str],
+        max_price: Optional[float],
+        user_lat: Optional[float],
+        user_lon: Optional[float],
+        max_distance_km: Optional[float],
+        k: int,
+    ) -> list[MenuChunk]:
+        sql = """
+            SELECT
+                id,
+                menu_item_id,
+                restaurant_id,
+                restaurant_name,
+                cuisine_name,
+                food_item,
+                description,
+                price,
+                rating,
+                latitude,
+                longitude,
+                combined_text,
+                1 - (embedding <=> %s::vector) AS similarity
+            FROM menu_embeddings
+            WHERE
+                (%s IS NULL OR cuisine_name ILIKE %s)
+                AND (%s IS NULL OR price <= %s)
+                AND (
+                    %s IS NULL OR %s IS NULL
+                    OR (
+                        6371 * acos(
+                            LEAST(1.0,
+                                cos(radians(%s)) * cos(radians(latitude)) *
+                                cos(radians(longitude) - radians(%s)) +
+                                sin(radians(%s)) * sin(radians(latitude))
+                            )
+                        ) <= %s
+                    )
+                )
+            ORDER BY embedding <=> %s::vector
+            LIMIT %s
+        """
+
+        params = (
+            emb_str,                        # query embedding for similarity
+            cuisine, cuisine,               # cuisine filter (NULL skips)
+            max_price, max_price,           # price filter (NULL skips)
+            user_lat, user_lon,             # NULL check for geo filter
+            user_lat, user_lon, user_lat,   # haversine calculation
+            max_distance_km,                # distance threshold
+            emb_str,                        # query embedding for ORDER BY
+            k,                              # LIMIT
+        )
+
+        conn = self._get_conn()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+
+        chunks = []
+        for row in rows:
+            chunks.append(MenuChunk(
+                chunk_id       = str(row["id"]),
+                restaurant_id  = str(row["restaurant_id"]),
+                restaurant_name= row["restaurant_name"],
+                cuisine        = row["cuisine_name"] or "",
+                item_id        = str(row["menu_item_id"]),
+                item_name      = row["food_item"],
+                price          = float(row["price"]),
+                text           = row["combined_text"],
+                description    = row["description"] or "",
+                rating         = float(row["rating"]) if row["rating"] else None,
+                latitude       = float(row["latitude"]) if row["latitude"] else None,
+                longitude      = float(row["longitude"]) if row["longitude"] else None,
+                metadata       = {"similarity": float(row["similarity"])},
+            ))
+        return chunks
 
 
-# Module-level singleton — loaded once at startup
+# Module-level singleton
 _retriever: Optional[Retriever] = None
 
 
@@ -133,8 +212,12 @@ def format_chunks_for_prompt(chunks: list[MenuChunk]) -> str:
         return "No relevant menu items found."
     lines = ["Relevant menu items:"]
     for c in chunks:
+        similarity = c.metadata.get("similarity", 0)
+        rating_str = f" ⭐{c.rating:.1f}" if c.rating else ""
         lines.append(
             f"- [{c.restaurant_id} / {c.item_id}] {c.item_name} @ {c.restaurant_name} "
-            f"({c.cuisine}) — ₹{c.price:.0f}"
+            f"({c.cuisine}) — ₹{c.price:.0f}{rating_str} "
+            f"[similarity: {similarity:.2f}]\n"
+            f"  {c.description}"
         )
     return "\n".join(lines)
