@@ -26,19 +26,19 @@ log = get_logger(__name__)
 
 @dataclass
 class MenuChunk:
-    chunk_id:       str
-    restaurant_id:  str
+    chunk_id:        str
+    restaurant_id:   str
     restaurant_name: str
-    cuisine:        str
-    item_id:        str
-    item_name:      str
-    price:          float
-    text:           str          # combined_text from DB
-    description:    str = ""
-    rating:         Optional[float] = None
-    latitude:       Optional[float] = None
-    longitude:      Optional[float] = None
-    metadata:       dict[str, Any] = field(default_factory=dict)
+    cuisine:         str
+    item_id:         str
+    item_name:       str
+    price:           float
+    text:            str          # combined_text from DB
+    description:     str = ""
+    rating:          Optional[float] = None
+    latitude:        Optional[float] = None
+    longitude:       Optional[float] = None
+    metadata:        dict[str, Any] = field(default_factory=dict)
 
 
 class Retriever:
@@ -56,7 +56,6 @@ class Retriever:
             f"password={s.pg_password} "
             f"port={s.pg_port}"
         )
-        # Verify connection at startup
         self._check_connection()
         log.info("retriever_ready", extra={"backend": "pgvector"})
 
@@ -64,10 +63,10 @@ class Retriever:
         try:
             conn = psycopg2.connect(self._pg_conn_str)
             with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM menu_embeddings")
+                cur.execute("SELECT COUNT(*) FROM restaurant_embeddings")
                 count = cur.fetchone()[0]
             conn.close()
-            log.info("pgvector_connected", extra={"menu_embeddings_count": count})
+            log.info("pgvector_connected", extra={"restaurant_embeddings_count": count})
         except Exception as e:
             log.error("pgvector_connection_failed", extra={"error": str(e)})
             raise
@@ -86,13 +85,9 @@ class Retriever:
         user_lon: Optional[float] = None,
         max_distance_km: Optional[float] = 10.0,
     ) -> list[MenuChunk]:
-        """
-        Embed query and search pgvector for similar menu items.
-        Filters: cuisine, max_price, geo-distance (optional).
-        """
+        """Embed query and search pgvector for similar menu items."""
         k = top_k or self.top_k
 
-        # Embed query — CPU bound, run in thread
         q_emb = await asyncio.to_thread(
             self.model.encode,
             [query],
@@ -100,10 +95,8 @@ class Retriever:
             convert_to_numpy=True,
         )
 
-        # Format embedding as Postgres vector string
         emb_str = "[" + ",".join(f"{v:.6f}" for v in q_emb[0].tolist()) + "]"
 
-        # Run DB query in thread to avoid blocking event loop
         results = await asyncio.to_thread(
             self._query_pgvector,
             emb_str, cuisine, max_price,
@@ -123,20 +116,18 @@ class Retriever:
     ) -> list[MenuChunk]:
         sql = """
             SELECT
-                id,
                 menu_item_id,
                 restaurant_id,
                 restaurant_name,
                 cuisine_name,
                 food_item,
-                description,
                 price,
                 rating,
                 latitude,
                 longitude,
                 combined_text,
                 1 - (embedding <=> %s::vector) AS similarity
-            FROM menu_embeddings
+            FROM restaurant_embeddings
             WHERE
                 (%s IS NULL OR cuisine_name ILIKE %s)
                 AND (%s IS NULL OR price <= %s)
@@ -145,9 +136,9 @@ class Retriever:
                     OR (
                         6371 * acos(
                             LEAST(1.0,
-                                cos(radians(%s)) * cos(radians(latitude)) *
-                                cos(radians(longitude) - radians(%s)) +
-                                sin(radians(%s)) * sin(radians(latitude))
+                                cos(radians(%s::float)) * cos(radians(latitude::float)) *
+                                cos(radians(longitude::float) - radians(%s::float)) +
+                                sin(radians(%s::float)) * sin(radians(latitude::float))
                             )
                         ) <= %s
                     )
@@ -157,14 +148,14 @@ class Retriever:
         """
 
         params = (
-            emb_str,                        # query embedding for similarity
-            cuisine, cuisine,               # cuisine filter (NULL skips)
-            max_price, max_price,           # price filter (NULL skips)
-            user_lat, user_lon,             # NULL check for geo filter
-            user_lat, user_lon, user_lat,   # haversine calculation
-            max_distance_km,                # distance threshold
-            emb_str,                        # query embedding for ORDER BY
-            k,                              # LIMIT
+            emb_str,                          # similarity calc
+            cuisine, cuisine,                 # cuisine filter
+            max_price, max_price,             # price filter
+            user_lat, user_lon,               # NULL check for geo
+            user_lat, user_lon, user_lat,     # haversine
+            max_distance_km,                  # distance threshold
+            emb_str,                          # ORDER BY
+            k,                                # LIMIT
         )
 
         conn = self._get_conn()
@@ -178,19 +169,19 @@ class Retriever:
         chunks = []
         for row in rows:
             chunks.append(MenuChunk(
-                chunk_id       = str(row["id"]),
-                restaurant_id  = str(row["restaurant_id"]),
-                restaurant_name= row["restaurant_name"],
-                cuisine        = row["cuisine_name"] or "",
-                item_id        = str(row["menu_item_id"]),
-                item_name      = row["food_item"],
-                price          = float(row["price"]),
-                text           = row["combined_text"],
-                description    = row["description"] or "",
-                rating         = float(row["rating"]) if row["rating"] else None,
-                latitude       = float(row["latitude"]) if row["latitude"] else None,
-                longitude      = float(row["longitude"]) if row["longitude"] else None,
-                metadata       = {"similarity": float(row["similarity"])},
+                chunk_id        = str(row["menu_item_id"]),
+                restaurant_id   = str(row["restaurant_id"]),
+                restaurant_name = row["restaurant_name"] or "",
+                cuisine         = row["cuisine_name"] or "",
+                item_id         = str(row["menu_item_id"]),
+                item_name       = row["food_item"] or "",
+                price           = float(row["price"]) if row["price"] else 0.0,
+                text            = row["combined_text"] or "",
+                description     = "",
+                rating          = float(row["rating"]) if row["rating"] else None,
+                latitude        = float(row["latitude"]) if row["latitude"] else None,
+                longitude       = float(row["longitude"]) if row["longitude"] else None,
+                metadata        = {"similarity": float(row["similarity"])},
             ))
         return chunks
 
@@ -217,7 +208,6 @@ def format_chunks_for_prompt(chunks: list[MenuChunk]) -> str:
         lines.append(
             f"- [{c.restaurant_id} / {c.item_id}] {c.item_name} @ {c.restaurant_name} "
             f"({c.cuisine}) — ₹{c.price:.0f}{rating_str} "
-            f"[similarity: {similarity:.2f}]\n"
-            f"  {c.description}"
+            f"[similarity: {similarity:.2f}]"
         )
     return "\n".join(lines)

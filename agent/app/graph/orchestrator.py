@@ -2,29 +2,44 @@
 
 Flow:
                 ┌──────────────┐
-   start ───▶   │   retrieve   │  (bge-m3 over menu corpus)
+   start ───▶   │    intent    │  classify: order_food | check_order_status | general
                 └──────┬───────┘
-                       │  (RAG context injected as a system note)
-                       ▼
-                ┌──────────────┐
-                │     llm      │◀────────────┐
-                └──────┬───────┘             │
-                       │                     │
-              tool_calls?                    │
-                 ├─ yes ─▶ ┌──────────────┐ │
-                 │         │    tools     │ │
-                 │         └──────┬───────┘ │
-                 │                └─────────┘
-                 └─ no ──▶ END (assistant message ready)
-
-The `llm` node may decide to call tools multiple times in sequence
-(e.g. get_user_addresses → place_order). The graph loops llm ⇄ tools
-up to max_tool_iterations before giving up and asking the user.
-
-Streaming note: streaming happens in `app/main.py` for the *final* turn
-only — after the model decides it's done calling tools. Intermediate
-tool-call decision turns are not streamed because we need the full
-response to decide whether to loop.
+                       │
+          ┌────────────┼────────────────┐
+          │            │                │
+     order_food  check_order_status  general
+          │            │                │
+          ▼            │                │
+  ┌──────────────┐     │                │
+  │collect_params│     │                │
+  └──────┬───────┘     │                │
+         │             │                │
+  complete?            │                │
+    ├─ no → END        │                │
+    │  (ask user)      │                │
+    └─ yes             │                │
+         ▼             ▼                ▼
+  ┌──────────────────────────────────────┐
+  │             retrieve                 │  (bge-m3 over menu corpus)
+  └──────────────────┬───────────────────┘
+                     │
+    order_food only  │
+         ▼           │
+  ┌──────────────┐   │
+  │semantic_match│   │  (resolves names → real IDs via pgvector)
+  └──────┬───────┘   │
+         └───────────┘
+                     ▼
+              ┌──────────────┐
+              │     llm      │◀────────────┐
+              └──────┬───────┘             │
+                     │                     │
+            tool_calls?                    │
+               ├─ yes ─▶ ┌──────────────┐ │
+               │         │    tools     │ │
+               │         └──────┬───────┘ │
+               │                └─────────┘
+               └─ no ──▶ END
 """
 from __future__ import annotations
 
@@ -34,7 +49,9 @@ from typing import Annotated, Any, Optional, TypedDict
 from langgraph.graph import StateGraph, END
 
 from agent.app.config import get_settings
+from agent.app.graph.intent import intent_node, collect_params_node
 from agent.app.graph.prompts import AKI_SYSTEM_PROMPT
+from agent.app.graph.semantic_match import semantic_match_node
 from agent.app.llm import chat_complete
 from agent.app.logging_setup import get_logger
 from agent.app.rag import format_chunks_for_prompt, get_retriever
@@ -51,11 +68,22 @@ def _merge_messages(left: list[dict], right: list[dict]) -> list[dict]:
 class GraphState(TypedDict, total=False):
     session_id: str
     user_message: str
-    # Full message list passed to the LLM — system + history + new user msg + tool turns
     messages: Annotated[list[dict[str, Any]], _merge_messages]
     rag_context: str
+
+    # Intent routing
+    intent: str                          # "order_food" | "check_order_status" | "general"
+
+    # Order parameter accumulation (persisted across turns via Valkey)
+    order_params: dict[str, Any]         # {restaurant_name, items: [{name, quantity}]}
+    params_complete: bool
+
+    # Semantic match results
+    semantic_matches: list[dict[str, Any]]
+
+    # Loop guard + output
     tool_iterations: int
-    final_text: str   # populated when we exit the loop
+    final_text: str
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -73,18 +101,12 @@ async def retrieve_node(state: GraphState) -> dict[str, Any]:
 
 
 async def llm_node(state: GraphState) -> dict[str, Any]:
-    """Call vLLM with current messages + tools.
+    """Call vLLM with current messages + tools."""
+    messages = list(state["messages"])
 
-    Returns the assistant message (text or tool_calls). The conditional
-    edge below decides whether we loop into the tools node or finish.
-    """
-    messages = list(state["messages"])  # copy
-
-    # Inject RAG context as an ephemeral system note BEFORE the latest user msg.
-    # We don't persist this to Valkey — it's per-turn.
+    # Inject RAG context as ephemeral system note before the last user message
     rag_ctx = state.get("rag_context", "")
     if rag_ctx:
-        # Find the last user message and insert RAG before it
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user":
                 messages.insert(i, {"role": "system", "content": rag_ctx})
@@ -94,7 +116,6 @@ async def llm_node(state: GraphState) -> dict[str, Any]:
     choice = resp.choices[0]
     msg = choice.message
 
-    # Build the assistant message in OpenAI shape
     assistant_msg: dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
     if msg.tool_calls:
         assistant_msg["tool_calls"] = [
@@ -145,8 +166,39 @@ async def tools_node(state: GraphState) -> dict[str, Any]:
     return {"messages": tool_messages, "tool_iterations": iters}
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Routing functions
+# ────────────────────────────────────────────────────────────────────────────
+
+def route_intent(state: GraphState) -> str:
+    """After intent_node: route to collect_params, retrieve, or retrieve directly."""
+    intent = state.get("intent", "general")
+    if intent == "order_food":
+        return "collect_params"
+    # check_order_status and general both go straight to retrieve
+    return "retrieve"
+
+
+def route_after_collect_params(state: GraphState) -> str:
+    """After collect_params_node: go to semantic_match or end turn."""
+    if state.get("params_complete"):
+        return "semantic_match"
+    # Params incomplete — final_text already set with clarifying question
+    return END
+
+
+def route_after_semantic_match(state: GraphState) -> str:
+    """After semantic_match_node: always go to retrieve for RAG context."""
+    return "retrieve"
+
+
+def route_after_retrieve(state: GraphState) -> str:
+    """After retrieve_node: always go to llm."""
+    return "llm"
+
+
 def should_continue(state: GraphState) -> str:
-    """Conditional edge: after llm_node, route to tools or end."""
+    """After llm_node: loop to tools or end."""
     last_msg = state["messages"][-1]
     has_tool_calls = bool(last_msg.get("tool_calls"))
     iters = state.get("tool_iterations", 0)
@@ -156,9 +208,6 @@ def should_continue(state: GraphState) -> str:
         return "tools"
     if has_tool_calls and iters >= max_iters:
         log.warning("tool_loop_exhausted", extra={"iterations": iters})
-        # Force-stop: replace the dangling tool-call message with a fallback
-        # We can't mutate state here cleanly, so we let it fall through and
-        # the main handler will detect missing final_text.
         return END
     return END
 
@@ -169,19 +218,57 @@ def should_continue(state: GraphState) -> str:
 
 def build_graph():
     g = StateGraph(GraphState)
+
+    # Register nodes
+    g.add_node("intent", intent_node)
+    g.add_node("collect_params", collect_params_node)
+    g.add_node("semantic_match", semantic_match_node)
     g.add_node("retrieve", retrieve_node)
     g.add_node("llm", llm_node)
     g.add_node("tools", tools_node)
 
-    g.set_entry_point("retrieve")
+    # Entry point
+    g.set_entry_point("intent")
+
+    # Intent routing
+    g.add_conditional_edges(
+        "intent",
+        route_intent,
+        {
+            "collect_params": "collect_params",
+            "retrieve": "retrieve",
+        },
+    )
+
+    # Param collection routing
+    g.add_conditional_edges(
+        "collect_params",
+        route_after_collect_params,
+        {
+            "semantic_match": "semantic_match",
+            END: END,
+        },
+    )
+
+    # Semantic match always goes to retrieve
+    g.add_edge("semantic_match", "retrieve")
+
+    # Retrieve always goes to llm
     g.add_edge("retrieve", "llm")
-    g.add_conditional_edges("llm", should_continue, {"tools": "tools", END: END})
+
+    # LLM routing — tool loop or end
+    g.add_conditional_edges(
+        "llm",
+        should_continue,
+        {"tools": "tools", END: END},
+    )
+
+    # Tools always loop back to llm
     g.add_edge("tools", "llm")
 
     return g.compile()
 
 
-# Module-level compiled graph
 _graph = None
 
 
@@ -196,7 +283,10 @@ def get_graph():
 # Public API
 # ────────────────────────────────────────────────────────────────────────────
 
-def build_initial_messages(history: list[dict[str, Any]], user_message: str) -> list[dict[str, Any]]:
+def build_initial_messages(
+    history: list[dict[str, Any]],
+    user_message: str,
+) -> list[dict[str, Any]]:
     """Prepend system prompt, append the new user message."""
     msgs: list[dict[str, Any]] = [{"role": "system", "content": AKI_SYSTEM_PROMPT}]
     msgs.extend(history)
@@ -208,13 +298,15 @@ async def run_turn(
     session_id: str,
     user_message: str,
     history: list[dict[str, Any]],
-) -> tuple[str, list[dict[str, Any]]]:
+    order_params: Optional[dict[str, Any]] = None,
+) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
     """Run a single conversational turn.
 
     Returns:
-      (final_assistant_text, updated_history)
-      where updated_history is what should be persisted to Valkey
-      (excludes system + ephemeral RAG context).
+      (final_assistant_text, updated_history, updated_order_params)
+
+    updated_order_params should be persisted to Valkey alongside history
+    so parameter accumulation works across turns.
     """
     graph = get_graph()
     initial_messages = build_initial_messages(history, user_message)
@@ -225,6 +317,9 @@ async def run_turn(
             "user_message": user_message,
             "messages": initial_messages,
             "tool_iterations": 0,
+            "order_params": order_params or {},
+            "params_complete": False,
+            "semantic_matches": [],
         }
     )
 
@@ -232,13 +327,24 @@ async def run_turn(
     if not final_text:
         final_text = "Sorry, I had trouble completing that. Could you rephrase?"
 
-    # Updated history = everything except the system prompt and ephemeral RAG
-    # injection. We rebuild by keeping the original history plus only messages
-    # added during this turn that are persistence-worthy.
+    # Rebuild history — exclude system prompts and ephemeral RAG/semantic injections
     new_messages: list[dict[str, Any]] = []
     for m in final_state["messages"]:
-        if m.get("role") == "system":
-            continue  # drop system & ephemeral RAG
+        role = m.get("role")
+        if role == "system":
+            continue
         new_messages.append(m)
 
-    return final_text, new_messages
+    # Return updated order_params — reset if order was placed
+    updated_order_params = final_state.get("order_params") or {}
+    # Clear params if order was successfully placed (place_order tool was called)
+    for m in new_messages:
+        if m.get("role") == "tool" and m.get("name") == "place_order":
+            try:
+                result = json.loads(m.get("content", "{}"))
+                if result.get("success"):
+                    updated_order_params = {}
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+    return final_text, new_messages, updated_order_params

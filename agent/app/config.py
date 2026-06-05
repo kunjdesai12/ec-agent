@@ -38,12 +38,13 @@ class Settings(BaseSettings):
     semantic_search_url: str = "http://localhost:8000"
 
     # pgvector (RDS Postgres — vector store)
-    pg_host: str = "easycater-vector-db.cngqs42w0l3u.ap-south-1.rds.amazonaws.com"
+    pg_host: str = "easycater-vector-db-v2.cngqs42w0l3u.ap-south-1.rds.amazonaws.com"
     pg_port: int = 5432
     pg_db: str = "easycater_vectors"
-    pg_user: str = "vectoradmin"
+    pg_user: str = ""
     pg_password: str = ""  # set via PG_PASSWORD env var or .env
-
+    use_memory_store: bool = True
+    tool_base_url: str = "http://localhost:3002"
 
 @lru_cache
 def get_settings() -> Settings:

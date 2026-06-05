@@ -24,6 +24,7 @@ from agent.app.graph.streaming import stream_turn
 from agent.app.logging_setup import configure_logging, get_logger
 from agent.app.rag import get_retriever
 from agent.app.state import get_redis, load_history, reset_history, save_history
+from agent.app.state.history import load_order_params, save_order_params
 
 configure_logging()
 log = get_logger(__name__)
@@ -87,8 +88,18 @@ async def health():
 async def chat_sync(req: ChatRequest):
     """Non-streaming chat — useful for tests and server-to-server calls."""
     history = await load_history(req.session_id)
-    text, new_history = await run_turn(req.session_id, req.message, history)
-    await save_history(req.session_id, history + [{"role": "user", "content": req.message}] + _without_user_dup(new_history, req.message))
+    order_params = await load_order_params(req.session_id)
+
+    text, new_history, updated_order_params = await run_turn(
+        req.session_id, req.message, history, order_params
+    )
+
+    await save_history(
+        req.session_id,
+        history + [{"role": "user", "content": req.message}] + _without_user_dup(new_history, req.message),
+    )
+    await save_order_params(req.session_id, updated_order_params)
+
     return ChatSyncResponse(session_id=req.session_id, text=text)
 
 
@@ -98,20 +109,28 @@ async def chat_stream(req: ChatRequest):
        status, tool, token, done, error — see app/graph/streaming.py
     """
     history = await load_history(req.session_id)
+    order_params = await load_order_params(req.session_id)
 
     async def event_gen():
         persistable: list[dict] | None = None
+        updated_params: dict = order_params
         try:
-            async for event in stream_turn(req.session_id, req.message, history):
+            async for event in stream_turn(
+                req.session_id, req.message, history, order_params
+            ):
                 if event["type"] == "done":
                     persistable = event["messages"]
+                    updated_params = event.get("order_params", {})
                     yield {"event": "done", "data": json.dumps({"ok": True})}
                 else:
                     yield {"event": event["type"], "data": json.dumps(event)}
+
             # Persist after the stream finishes successfully
             if persistable is not None:
                 new_hist = history + persistable
                 await save_history(req.session_id, new_hist)
+                await save_order_params(req.session_id, updated_params)
+
         except asyncio.CancelledError:
             log.info("client_disconnect", extra={"session_id": req.session_id})
             raise
@@ -122,6 +141,7 @@ async def chat_stream(req: ChatRequest):
 @app.post("/v1/session/{session_id}/reset")
 async def reset_session(session_id: str):
     await reset_history(session_id)
+    await save_order_params(session_id, {})  # clear order params too
     return {"ok": True, "session_id": session_id}
 
 

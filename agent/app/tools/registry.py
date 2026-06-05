@@ -25,7 +25,7 @@ from agent.app.config import get_settings
 
 load_dotenv()
 
-BASE_URL = os.getenv("TOOL_BASE_URL")
+BASE_URL = get_settings().tool_base_url
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
@@ -339,6 +339,13 @@ async def _search_food(args: dict[str, Any]) -> dict[str, Any]:
     cuisine = args.get("cuisine")
     max_price = args.get("max_price")
 
+    return {
+        "results": [
+            {"restaurant_id": 1, "restaurant_name": "Domino's", "item_id": 101, "item_name": "Margherita Pizza", "price": 199, "cuisine": "Italian"},
+            {"restaurant_id": 2, "restaurant_name": "Biryani House", "item_id": 201, "item_name": "Chicken Biryani", "price": 249, "cuisine": "Mughlai"},
+        ]
+    }
+
     # Parse query into fields — single field goes as menu_item
     # unless it clearly looks like a restaurant name (handled by LLM upstream)
     payload = {
@@ -390,6 +397,17 @@ async def _get_menu(args: dict[str, Any]) -> dict[str, Any]:
     """
     restaurant_id = args.get("restaurant_id")
     
+    return {
+        "restaurant_id": args.get("restaurant_id"),
+        "menu": [
+            {"item_id": "101", "name": "Margherita Pizza", "price": 199.0, "category": "Pizza"},
+            {"item_id": "102", "name": "Pepperoni Pizza", "price": 249.0, "category": "Pizza"},
+            {"item_id": "103", "name": "Garlic Bread", "price": 99.0, "category": "Sides"},
+        ],
+        "total_items": 3,
+        "success": True,
+    }
+
     if not restaurant_id:
         return {
             "error": "restaurant_id is required",
@@ -565,6 +583,17 @@ async def _place_order(
         is_cod: Whether to use Cash on Delivery. Defaults to False (online payment).
         order_instructions: Optional special instructions for the restaurant.
     """
+    
+    return {
+        "success": True,
+        "order_id": 99001,
+        "status": "placed",
+        "restaurant_id": restaurant_id,
+        "items": menu_item_ids,
+        "total": price * quantity,
+        "message": "Order placed successfully (stub)",
+    }
+
     cart_payload = {
         "restaurants": [
             {
@@ -637,7 +666,13 @@ async def _get_order_status(
         order_id: Unique order ID
         jwt_token: User JWT bearer token
     """
-
+    return {
+        "order_id": order_id,
+        "status": "preparing",
+        "restaurant": "Stub Restaurant",
+        "estimated_delivery": "30-40 mins",
+        "payment_status": "paid",
+    }
     url = f"{BASE_URL}/order/{order_id}"
 
     headers = {
