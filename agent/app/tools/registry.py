@@ -100,7 +100,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "restaurant_id": {
                     "type": "string",
                     "description": "The unique ID of the restaurant (e.g. '30', '25')"
-                }
+                },
             },
             "required": ["restaurant_id"],
         },
@@ -117,11 +117,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "restaurant_id": {
                     "type": "string",
                     "description": "The unique ID of the restaurant (e.g. '25', '30')"
-                }
+                },
             },
             "required": ["restaurant_id"]
-        }
-    }
+        },
+    },
     },
     {
         "type": "function",
@@ -275,26 +275,84 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "cancel_order",
-            "description": "Cancel an order. Only works while order is in 'placed' or 'confirmed' state.",
+            "name": "get_active_orders",
+            "description": (
+                "Fetch the current user's active orders. "
+                "Call this FIRST when user wants to cancel but hasn't provided an order_id. "
+                "Returns list of active orders with order_id, status, restaurant name, "
+                "items, total amount and scheduled time. "
+                "If multiple orders exist, show them to user and ask which one to cancel."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "order_id": {"type": "string"},
-                    "reason": {"type": "string"},
+                    "jwt_token": {
+                        "type": "string",
+                        "description": "JWT bearer token for the authenticated user."
+                    }
                 },
-                "required": ["order_id"],
-            },
-        },
+                "required": ["jwt_token"]
+            }
+        }
     },
+
     {
         "type": "function",
         "function": {
-            "name": "get_user_addresses",
-            "description": "List the user's saved delivery addresses. Use before place_order if address is unknown.",
-            "parameters": {"type": "object", "properties": {}},
+            "name": "cancel_order",
+            "description": (
+                "Cancel a food order by order_id. "
+                "orderId goes in the URL path, reason goes in the request body. "
+                "Backend handles all eligibility checks internally: "
+                "  - Instant orders: cancellable within 4 hours of scheduled time. "
+                "  - Catering orders: cancellable only if 48+ hours before scheduled time. "
+                "  - Refund is triggered automatically via Razorpay. "
+                "If cancellation is not allowed, backend returns a clear error — "
+                "pass it directly to the user. "
+                "Always call get_active_orders first if you don't have the order_id."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_id": {
+                        "type": "integer",
+                        "description": "The order ID to cancel. Get this from get_active_orders if unknown."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Reason for cancellation. Ask the user if not provided."
+                    },
+                    "jwt_token": {
+                        "type": "string",
+                        "description": "JWT bearer token for the authenticated user."
+                    }
+                },
+                "required": ["order_id", "reason", "jwt_token"]
+            }
+        }
+    },
+    {
+    "type": "function",
+    "function": {
+        "name": "get_user_addresses",
+        "description": (
+            "List all the user's saved delivery addresses (e.g. Home, Work, or any custom label). "
+            "Always call this before place_order if the user hasn't explicitly provided a full address. "
+            "Returns address_id, label, full_address, landmark, floor_no, house_number, city, state, "
+            "pincode, latitude, longitude, and is_primary — all fields needed directly for place_order."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "jwt_token": {
+                    "type": "string",
+                    "description": "JWT bearer token for the authenticated user."
+                }
+            },
+            "required": ["jwt_token"],
         },
     },
+},
 ]
 
 
@@ -691,17 +749,184 @@ async def _get_order_status(
         return response.json()
     
 
+async def _get_active_orders(args: dict[str, Any]) -> dict[str, Any]:
+    jwt_token = args.get("jwt_token")
+
+    if not jwt_token:
+        return {"error": "jwt_token is required", "success": False}
+
+    headers = {"Authorization": f"Bearer {jwt_token}"}
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(
+                f"{BASE_URL}/order/user/active-order",
+                params={"order_type": "instant"},  # hardcoded — dinein not implemented yet
+                headers=headers
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        orders_raw = (
+            data.get("data")
+            or data.get("orders")
+            or data.get("result")
+            or []
+        )
+
+        if not orders_raw:
+            return {
+                "success": True,
+                "active_orders": [],
+                "count": 0,
+                "message": "No active orders found."
+            }
+
+        active_orders = []
+        for order in orders_raw:
+            active_orders.append({
+                "order_id":        order.get("order_id") or order.get("id"),
+                "status":          order.get("status", "unknown"),
+                "is_cod":          order.get("is_cod", False),
+                "grand_total":     order.get("grand_total") or order.get("total_amount", 0),
+                "scheduled_date":  order.get("order_schedule_date", ""),
+                "scheduled_time":  order.get("order_schedule_time", ""),
+                "restaurant_name": (
+                    order.get("restaurant", {}).get("restaurant_name")
+                    or order.get("restaurant_name", "Unknown Restaurant")
+                ),
+                "items": [
+                    {
+                        "name":     item.get("title") or item.get("name", ""),
+                        "quantity": item.get("quantity", 1),
+                        "price":    item.get("price", 0),
+                    }
+                    for item in (order.get("order_items") or order.get("items") or [])
+                ],
+                "placed_at": order.get("createdAt") or order.get("created_at", ""),
+            })
+
+        return {
+            "success":       True,
+            "active_orders": active_orders,
+            "count":         len(active_orders)
+        }
+
+    except httpx.HTTPStatusError as e:
+        return {"success": False, "error": f"API error {e.response.status_code}"}
+    except Exception as e:
+        return {"success": False, "error": f"Failed to fetch active orders: {str(e)}"}
+
+
 async def _cancel_order(args: dict[str, Any]) -> dict[str, Any]:
-    return {"order_id": args["order_id"], "status": "cancelled", "refund_initiated": True}
+    order_id  = args.get("order_id")
+    reason    = args.get("reason", "").strip()
+    jwt_token = args.get("jwt_token")
 
+    if not order_id:
+        return {"success": False, "error": "order_id is required."}
+    if not reason:
+        return {"success": False, "error": "reason is required. Please ask the user why they want to cancel."}
+    if not jwt_token:
+        return {"success": False, "error": "jwt_token is required."}
 
-async def _get_user_addresses(_: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "addresses": [
-            {"address_id": "addr_001", "label": "Home", "line": "12 Alkapuri, Vadodara"},
-            {"address_id": "addr_002", "label": "Office", "line": "Race Course Road, Vadodara"},
-        ]
+    headers = {"Authorization": f"Bearer {jwt_token}"}
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                f"{BASE_URL}/cancellation/orders/{order_id}/cancel",  # orderId in path
+                json={"reason": reason},                               # only reason in body
+                headers=headers
+            )
+
+        if response.status_code == 400:
+            try:
+                error_msg = response.json().get("message") or "Cancellation not allowed."
+            except Exception:
+                error_msg = response.text or "Cancellation not allowed."
+            return {"success": False, "cancelled": False, "error": error_msg}
+
+        if response.status_code == 404:
+            return {"success": False, "cancelled": False, "error": "Order not found."}
+
+        response.raise_for_status()
+
+        return {
+            "success":     True,
+            "cancelled":   True,
+            "order_id":    order_id,
+            "message":     "Order cancelled successfully.",
+            "refund_note": "Refund will be processed to your original payment method within 5-7 business days.",
+        }
+
+    except httpx.HTTPStatusError as e:
+        try:
+            error_msg = e.response.json().get("message") or str(e.response.text)
+        except Exception:
+            error_msg = e.response.text
+        return {"success": False, "cancelled": False, "error": f"Cancellation failed: {error_msg}"}
+
+    except Exception as e:
+        return {"success": False, "cancelled": False, "error": f"Something went wrong: {str(e)}"}
+
+async def _get_user_addresses(args: dict[str, Any]) -> dict[str, Any]:
+    jwt_token = args.get("jwt_token")
+
+    if not jwt_token:
+        return {"error": "jwt_token is required", "status": "failed"}
+
+    headers = {
+        "Authorization": f"Bearer {jwt_token}"
     }
+
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        try:
+            response = await client.get(
+                f"{BASE_URL}/users/get-address",
+                headers=headers
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            raw_addresses = data.get("data", {}).get("user_address", [])
+
+            if not raw_addresses:
+                return {
+                    "success": True,
+                    "addresses": [],
+                    "total": 0,
+                    "message": "No saved addresses found for this user."
+                }
+
+            cleaned_addresses = [
+                {
+                    "address_id":   addr.get("address_id"),
+                    "label":        addr.get("address_name"),        # Home / Work / custom
+                    "full_address": addr.get("user_address"),
+                    "landmark":     addr.get("landmark"),
+                    "floor_no":     addr.get("floor_no"),
+                    "house_number": addr.get("house_number"),
+                    "city":         addr.get("user_city"),
+                    "state":        addr.get("user_state"),
+                    "pincode":      addr.get("user_pincode"),
+                    "latitude":     addr.get("latitude"),
+                    "longitude":    addr.get("longitude"),
+                    "is_primary":   addr.get("primary_address"),
+                }
+                for addr in raw_addresses
+            ]
+
+            return {
+                "success": True,
+                "addresses": cleaned_addresses,
+                "total": len(cleaned_addresses)
+            }
+
+        except httpx.HTTPStatusError as e:
+            return {"error": f"API Error: {e.response.status_code}", "status": "failed"}
+        except Exception as e:
+            return {"error": f"Failed to fetch addresses: {str(e)}", "status": "failed"}
 
 
 HANDLERS: dict[str, ToolHandler] = {
@@ -710,6 +935,7 @@ HANDLERS: dict[str, ToolHandler] = {
     "get_restaurant_details": _get_restaurant_details,
     "place_order": _place_order,
     "get_order_status": _get_order_status,
+    "get_active_orders": _get_active_orders,
     "cancel_order": _cancel_order,
     "get_user_addresses": _get_user_addresses,
 }
