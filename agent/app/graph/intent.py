@@ -30,7 +30,7 @@ Respond with ONLY a JSON object, nothing else:
 async def intent_node(state: dict[str, Any]) -> dict[str, Any]:
     """Classify user message intent."""
     user_message = state["user_message"]
-
+    print(user_message)
     resp = await chat_complete(
         [
             {"role": "system", "content": _INTENT_SYSTEM},

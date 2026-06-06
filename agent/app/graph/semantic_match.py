@@ -58,14 +58,17 @@ def _match_restaurant(restaurant_name: str, top_k: int = 3) -> list[dict]:
     """Search restaurant_name_embedding for best matching restaurants."""
     emb = _embed(restaurant_name)
     sql = """
-        SELECT DISTINCT ON (restaurant_id)
-            restaurant_id,
-            restaurant_name,
-            cuisine_name,
-            1 - (restaurant_name_embedding <=> %s::vector) AS similarity
-        FROM restaurant_embeddings
-        WHERE restaurant_name_embedding IS NOT NULL
-        ORDER BY restaurant_id, restaurant_name_embedding <=> %s::vector
+        SELECT * FROM (
+            SELECT DISTINCT ON (restaurant_id)
+                restaurant_id,
+                restaurant_name,
+                cuisine_name,
+                1 - (restaurant_name_embedding <=> %s::vector) AS similarity
+            FROM restaurant_embeddings
+            WHERE restaurant_name_embedding IS NOT NULL
+            ORDER BY restaurant_id, restaurant_name_embedding <=> %s::vector
+        ) sub
+        ORDER BY similarity DESC
         LIMIT %s
     """
     conn = _get_conn()
@@ -90,16 +93,19 @@ def _match_items_in_restaurant(
             for item_name in item_names:
                 emb = _embed(item_name)
                 sql = """
-                    SELECT
-                        menu_item_id,
-                        food_item,
-                        price,
-                        cuisine_name,
-                        1 - (food_item_embedding <=> %s::vector) AS similarity
-                    FROM restaurant_embeddings
-                    WHERE restaurant_id = %s
-                      AND food_item_embedding IS NOT NULL
-                    ORDER BY food_item_embedding <=> %s::vector
+                    SELECT * FROM (
+                        SELECT DISTINCT ON (menu_item_id)
+                            menu_item_id,
+                            food_item,
+                            price,
+                            cuisine_name,
+                            1 - (food_item_embedding <=> %s::vector) AS similarity
+                        FROM restaurant_embeddings
+                        WHERE restaurant_id = %s
+                          AND food_item_embedding IS NOT NULL
+                        ORDER BY menu_item_id, food_item_embedding <=> %s::vector
+                    ) sub
+                    ORDER BY similarity DESC
                     LIMIT %s
                 """
                 cur.execute(sql, (emb, restaurant_id, emb, top_k_per_item))
@@ -182,11 +188,10 @@ async def semantic_match_node(state: dict[str, Any]) -> dict[str, Any]:
 
     # ── Step 3: Build context + semantic_matches ──────────────────────────
     lines = [
-        "## Resolved order parameters (use these exact IDs in place_order):",
-        f"Restaurant: {matched_restaurant_name} "
-        f"(restaurant_id={restaurant_id}, similarity={restaurant_similarity:.2f})",
+        "## CRITICAL: Use ONLY the following exact data. Do NOT invent, guess, or add any menu items not listed below.",
+        f"Restaurant: {matched_restaurant_name} (restaurant_id={restaurant_id})",
         "",
-        "Matched menu items:",
+        "Available matched menu items (ONLY these exist — do not add others):",
     ]
 
     semantic_matches = []
@@ -241,11 +246,12 @@ async def semantic_match_node(state: dict[str, Any]) -> dict[str, Any]:
     if semantic_matches:
         lines += [
             "",
-            "Instructions:",
-            "1. Use EXACT restaurant name from above — never paraphrase or invent names.",
-            "2. If similarity < 0.6 for any item, flag the mismatch and ask user to confirm.",
-            "3. Mention any NOT FOUND items clearly to the user.",
-            "4. Use the item_id and restaurant_id values above — do not guess or invent IDs.",
+            "STRICT INSTRUCTIONS:",
+            "1. ONLY mention menu items listed above — NEVER invent or suggest unlisted items.",
+            "2. Use EXACT restaurant name and item names from above.",
+            "3. Mention any NOT FOUND items clearly — do not substitute with invented items.",
+            "4. Use ONLY the item_id and restaurant_id values above in place_order.",
+            "5. If user asks for an item not in the list above, say it is not available.",
         ]
     else:
         # All items not found
