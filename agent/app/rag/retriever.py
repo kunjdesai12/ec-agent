@@ -84,90 +84,103 @@ class Retriever:
         user_lat: Optional[float] = None,
         user_lon: Optional[float] = None,
         max_distance_km: Optional[float] = 10.0,
+        restaurant_name: Optional[str] = None,
+        menu_item: Optional[str] = None,
     ) -> list[MenuChunk]:
         """Embed query and search pgvector for similar menu items."""
         k = top_k or self.top_k
 
-        q_emb = await asyncio.to_thread(
-            self.model.encode,
-            [query],
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-        )
+        # Build field map — which columns to search and with what embeddings
+        fields = {}
+        if restaurant_name:
+            emb = await asyncio.to_thread(
+                self.model.encode, [restaurant_name],
+                normalize_embeddings=True, convert_to_numpy=True
+            )
+            fields["restaurant_name"] = ("restaurant_name_embedding", emb[0])
+        if menu_item:
+            emb = await asyncio.to_thread(
+                self.model.encode, [menu_item],
+                normalize_embeddings=True, convert_to_numpy=True
+            )
+            fields["menu_item"] = ("food_item_embedding", emb[0])
+        if cuisine:
+            emb = await asyncio.to_thread(
+                self.model.encode, [cuisine],
+                normalize_embeddings=True, convert_to_numpy=True
+            )
+            fields["cuisine"] = ("cuisine_embedding", emb[0])
 
-        emb_str = "[" + ",".join(f"{v:.6f}" for v in q_emb[0].tolist()) + "]"
+        # Fall back to combined_text search if no structured fields detected
+        if not fields:
+            q_emb = await asyncio.to_thread(
+                self.model.encode,
+                [query],  
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+            )
+            fields["combined"] = ("embedding", q_emb[0])
 
         results = await asyncio.to_thread(
-            self._query_pgvector,
-            emb_str, cuisine, max_price,
-            user_lat, user_lon, max_distance_km, k
+            self._query_field_aware,
+            fields, max_price, user_lat, user_lon, max_distance_km, k
         )
         return results
 
-    def _query_pgvector(
-        self,
-        emb_str: str,
-        cuisine: Optional[str],
-        max_price: Optional[float],
-        user_lat: Optional[float],
-        user_lon: Optional[float],
-        max_distance_km: Optional[float],
-        k: int,
-    ) -> list[MenuChunk]:
-        sql = """
-            SELECT
-                menu_item_id,
-                restaurant_id,
-                restaurant_name,
-                cuisine_name,
-                food_item,
-                price,
-                rating,
-                latitude,
-                longitude,
-                combined_text,
-                1 - (embedding <=> %s::vector) AS similarity
-            FROM restaurant_embeddings
-            WHERE
-                (%s IS NULL OR cuisine_name ILIKE %s)
-                AND (%s IS NULL OR price <= %s)
-                AND (
-                    %s IS NULL OR %s IS NULL
-                    OR (
-                        6371 * acos(
-                            LEAST(1.0,
-                                cos(radians(%s::float)) * cos(radians(latitude::float)) *
-                                cos(radians(longitude::float) - radians(%s::float)) +
-                                sin(radians(%s::float)) * sin(radians(latitude::float))
-                            )
-                        ) <= %s
-                    )
-                )
-            ORDER BY embedding <=> %s::vector
-            LIMIT %s
-        """
-
-        params = (
-            emb_str,                          # similarity calc
-            cuisine, cuisine,                 # cuisine filter
-            max_price, max_price,             # price filter
-            user_lat, user_lon,               # NULL check for geo
-            user_lat, user_lon, user_lat,     # haversine
-            max_distance_km,                  # distance threshold
-            emb_str,                          # ORDER BY
-            k,                                # LIMIT
-        )
-
+    def _query_field_aware(self, fields, max_price, user_lat, user_lon, max_distance_km, k):
         conn = self._get_conn()
+        scores = {}  # menu_item_id → {row, total_sim, field_count}
+
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(sql, params)
-                rows = cur.fetchall()
+                for field_name, (col, emb) in fields.items():
+                    emb_str = "[" + ",".join(f"{v:.6f}" for v in emb.tolist()) + "]"
+                    cur.execute(f"""
+                        SELECT *,
+                            1 - ({col} <=> %s::vector) AS similarity
+                        FROM restaurant_embeddings
+                        WHERE
+                            (%s IS NULL OR price <= %s)
+                            AND (%s IS NULL OR %s IS NULL OR
+                                6371 * acos(LEAST(1.0,
+                                    cos(radians(%s::float)) * cos(radians(latitude::float)) *
+                                    cos(radians(longitude::float) - radians(%s::float)) +
+                                    sin(radians(%s::float)) * sin(radians(latitude::float))
+                                )) <= %s)
+                        ORDER BY {col} <=> %s::vector
+                        LIMIT %s
+                    """, (
+                        emb_str,
+                        max_price, max_price,
+                        user_lat, user_lon, user_lat, user_lon, user_lat, max_distance_km,
+                        emb_str, k * 3
+                    ))
+                    rows = cur.fetchall()
+                    for row in rows:
+                        mid = row["menu_item_id"]
+                        if mid not in scores:
+                            scores[mid] = {"row": row, "total_sim": 0.0, "field_count": 0}
+                        scores[mid]["total_sim"] += float(row["similarity"])
+                        scores[mid]["field_count"] += 1
         finally:
             conn.close()
 
+        # Average similarity, penalize rows that only matched some fields
+        n_fields = len(fields)
+        merged = []
+        for mid, data in scores.items():
+            avg_sim = data["total_sim"] / n_fields
+            if data["field_count"] < n_fields:
+                avg_sim *= 0.7  # penalty for partial match — same as semantic_search.py
+            row = dict(data["row"])
+            row["similarity"] = round(avg_sim, 6)
+            merged.append(row)
+
+        merged.sort(key=lambda x: x["similarity"], reverse=True)
+
+        # Convert to MenuChunk
         chunks = []
-        for row in rows:
+        for row in merged[:k]:
             chunks.append(MenuChunk(
                 chunk_id        = str(row["menu_item_id"]),
                 restaurant_id   = str(row["restaurant_id"]),
@@ -177,7 +190,6 @@ class Retriever:
                 item_name       = row["food_item"] or "",
                 price           = float(row["price"]) if row["price"] else 0.0,
                 text            = row["combined_text"] or "",
-                description     = "",
                 rating          = float(row["rating"]) if row["rating"] else None,
                 latitude        = float(row["latitude"]) if row["latitude"] else None,
                 longitude       = float(row["longitude"]) if row["longitude"] else None,

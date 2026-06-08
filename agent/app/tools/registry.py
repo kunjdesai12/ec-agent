@@ -397,13 +397,6 @@ async def _search_food(args: dict[str, Any]) -> dict[str, Any]:
     cuisine = args.get("cuisine")
     max_price = args.get("max_price")
 
-    return {
-        "results": [
-            {"restaurant_id": 1, "restaurant_name": "Domino's", "item_id": 101, "item_name": "Margherita Pizza", "price": 199, "cuisine": "Italian"},
-            {"restaurant_id": 2, "restaurant_name": "Biryani House", "item_id": 201, "item_name": "Chicken Biryani", "price": 249, "cuisine": "Mughlai"},
-        ]
-    }
-
     # Parse query into fields — single field goes as menu_item
     # unless it clearly looks like a restaurant name (handled by LLM upstream)
     payload = {
