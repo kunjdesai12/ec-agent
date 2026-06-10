@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 from typing import Annotated, Any, Optional, TypedDict
+import re
 
 from langgraph.graph import StateGraph, END
 
@@ -90,13 +91,64 @@ class GraphState(TypedDict, total=False):
 # Nodes
 # ────────────────────────────────────────────────────────────────────────────
 
+_QUERY_EXTRACT_SYSTEM = """\
+You are a structured data extractor for a food delivery app.
+Extract from the user message:
+- restaurant_name: name of a specific restaurant, or null
+- menu_item: a specific food or drink item, or null
+- cuisine: a broad cuisine category ONLY if explicitly stated
+  (e.g. "punjabi", "chinese", "south indian"), or null
+
+Rules:
+- Extract ONLY what is literally present. Do not infer cuisine from dish names.
+- "I want something punjabi" → cuisine: "punjabi", others null
+- "biryani from Hotel XYZ" → restaurant_name: "Hotel XYZ", menu_item: "biryani", cuisine: null
+- "something creamy" → all null
+Return ONLY valid JSON, nothing else.
+{"restaurant_name": "..or null", "menu_item": "..or null", "cuisine": "..or null"}
+"""
+
+async def _extract_query_fields(user_message: str) -> dict:
+    resp = await chat_complete(
+        [
+            {"role": "system", "content": _QUERY_EXTRACT_SYSTEM},
+            {"role": "user", "content": user_message},
+        ],
+        tools=None,
+        tool_choice=None,
+        stream=False,
+    )
+    raw = (resp.choices[0].message.content or "").strip()
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {"restaurant_name": None, "menu_item": None, "cuisine": None}
+
+
 async def retrieve_node(state: GraphState) -> dict[str, Any]:
-    """Run bge-m3 retrieval over the menu corpus using the user's message."""
     query = state["user_message"]
+
+    # Extract structured fields from the query
+    extracted = await _extract_query_fields(query)
+    restaurant_name = extracted.get("restaurant_name")
+    menu_item       = extracted.get("menu_item")
+    cuisine         = extracted.get("cuisine")
+
     retriever = get_retriever()
-    chunks = await retriever.search(query)
+    chunks = await retriever.search(
+        query,
+        restaurant_name=restaurant_name,
+        menu_item=menu_item,
+        cuisine=cuisine,
+    )
+
     ctx = format_chunks_for_prompt(chunks)
-    log.info("rag_retrieved", extra={"n_chunks": len(chunks), "query": query[:80]})
+    log.info("rag_retrieved", extra={
+        "n_chunks": len(chunks),
+        "query": query[:80],
+        "extracted": extracted,
+    })
     return {"rag_context": ctx}
 
 
