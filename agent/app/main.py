@@ -21,6 +21,7 @@ from sse_starlette.sse import EventSourceResponse
 from agent.app.config import get_settings
 from agent.app.graph import run_turn
 from agent.app.graph.streaming import stream_turn
+from agent.app.guardrails_middleware import AkiGuardrails
 from agent.app.logging_setup import configure_logging, get_logger
 from agent.app.rag import get_retriever
 from agent.app.state import get_redis, load_history, reset_history, save_history
@@ -29,12 +30,16 @@ from agent.app.state.history import load_order_params, save_order_params
 configure_logging()
 log = get_logger(__name__)
 
+guardrails = AkiGuardrails()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: ARG001
     # Warm up retriever (loads bge-m3 ~2GB into RAM)
     log.info("startup_begin")
     get_retriever()
+    # Initialize guardrails
+    await guardrails.initialize()
     # Ping Redis
     r = await get_redis()
     await r.ping()
@@ -81,12 +86,28 @@ async def health():
     except Exception as e:  # noqa: BLE001
         redis_ok = False
         log.error("redis_health_failed", extra={"err": str(e)})
-    return {"ok": redis_ok, "redis": redis_ok, "model": get_settings().vllm_model}
+    return {
+        "ok": redis_ok,
+        "redis": redis_ok,
+        "model": get_settings().vllm_model,
+        "guardrails": guardrails._initialized,
+    }
 
 
 @app.post("/v1/chat/sync", response_model=ChatSyncResponse)
 async def chat_sync(req: ChatRequest):
     """Non-streaming chat — useful for tests and server-to-server calls."""
+
+    # ── Guardrail input check ──────────────────────────────────
+    guard = await guardrails.check_input(req.message, req.session_id)
+    if guard["blocked"]:
+        log.info(
+            "guardrail_blocked",
+            extra={"session_id": req.session_id, "violation": guard["violation"]},
+        )
+        return ChatSyncResponse(session_id=req.session_id, text=guard["response"])
+
+    # ── Normal pipeline ────────────────────────────────────────
     history = await load_history(req.session_id)
     order_params = await load_order_params(req.session_id)
 
@@ -112,6 +133,18 @@ async def chat_stream(req: ChatRequest):
     order_params = await load_order_params(req.session_id)
 
     async def event_gen():
+        # ── Guardrail input check ──────────────────────────────
+        guard = await guardrails.check_input(req.message, req.session_id)
+        if guard["blocked"]:
+            log.info(
+                "guardrail_blocked",
+                extra={"session_id": req.session_id, "violation": guard["violation"]},
+            )
+            yield {"event": "token", "data": json.dumps({"text": guard["response"]})}
+            yield {"event": "done",  "data": json.dumps({"ok": True})}
+            return
+
+        # ── Normal pipeline ────────────────────────────────────
         persistable: list[dict] | None = None
         updated_params: dict = order_params
         try:
