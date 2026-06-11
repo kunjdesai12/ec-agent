@@ -112,7 +112,6 @@ class AkiGuardrails:
         try:
             result = await self.rails.generate_async(
                 messages=[{"role": "user", "content": user_message}],
-                context=context,
                 options={
                     "rails": ["input"],   # input rails only, no LLM generation
                     "output_vars": True,

@@ -1,60 +1,20 @@
-# config/config.yml
-# NeMo Guardrails config for Aki - EasyCater Voice Ordering Assistant
-
 models:
-  # Main LLM — your existing vLLM endpoint
   - type: main
-    engine: openai         # vLLM exposes OpenAI-compatible API
+    engine: openai
     model: Qwen2.5-7B-Instruct-GPTQ-Int4
     parameters:
-      openai_api_base: "http://localhost:8001/v1"
-      openai_api_key: "not-needed"   # vLLM doesn't require a real key
+      base_url: "http://localhost:8001/v1"
+      api_key: "not-needed"
 
-  # Self-check model — uses same LLM to validate inputs/outputs
-  # No extra cost, no extra GPU memory (reuses vLLM)
   - type: self_check
     engine: openai
     model: Qwen2.5-7B-Instruct-GPTQ-Int4
     parameters:
-      openai_api_base: "http://localhost:8001/v1"
-      openai_api_key: "not-needed"
+      base_url: "http://localhost:8001/v1"
+      api_key: "not-needed"
 
-rails:
-  # ── INPUT RAILS ─────────────────────────────────────────────
-  # Applied to every user message BEFORE it reaches Aki/LangGraph
-  input:
-    flows:
-      - check jailbreak attempt
-      - check off topic input
-      - check competitor mention
-      - check abusive language
-      - check order manipulation
-
-  # ── OUTPUT RAILS ────────────────────────────────────────────
-  # Applied to every Aki response BEFORE it reaches the user
-  output:
-    flows:
-      - check response on topic
-      - check no hallucinated menu
-      - check no competitor mention in response
-      - self check output
-
-  # ── DIALOG RAILS ────────────────────────────────────────────
-  # Define valid conversation flows and enforce order steps
-  dialog:
-    user_messages:
-      - ask about menu
-      - ask to place order
-      - ask order status
-      - greet
-      - say goodbye
-      - ask off topic
-      - attempt jailbreak
-
-# Embeddings for semantic similarity matching in dialog rails
 embeddings:
   - model: BAAI/bge-m3
     engine: SentenceTransformers
 
-# Colang version
 colang_version: "2.x"

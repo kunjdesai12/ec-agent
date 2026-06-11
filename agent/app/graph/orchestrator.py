@@ -61,6 +61,15 @@ from agent.app.tools import TOOL_SCHEMAS, execute_tool
 log = get_logger(__name__)
 
 
+_AUTH_REQUIRED_TOOLS = frozenset({
+    "place_order",
+    "get_order_status",
+    "get_active_orders",
+    "cancel_order",
+    "get_user_addresses",
+})
+
+
 def _merge_messages(left: list[dict], right: list[dict]) -> list[dict]:
     """Reducer: append new messages to existing history."""
     return left + right
@@ -71,6 +80,7 @@ class GraphState(TypedDict, total=False):
     user_message: str
     messages: Annotated[list[dict[str, Any]], _merge_messages]
     rag_context: str
+    jwt_token: str
 
     # Intent routing
     intent: str                          # "order_food" | "check_order_status" | "general"
@@ -198,11 +208,26 @@ async def tools_node(state: GraphState) -> dict[str, Any]:
     """Execute all tool calls from the most recent assistant message."""
     last_msg = state["messages"][-1]
     tool_calls = last_msg.get("tool_calls", [])
+    jwt_token = state.get("jwt_token", "")
 
     tool_messages: list[dict[str, Any]] = []
     for tc in tool_calls:
         name = tc["function"]["name"]
-        args = tc["function"]["arguments"]
+
+        # Parse LLM-provided arguments
+        raw_args = tc["function"]["arguments"]
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args) if raw_args else {}
+            except json.JSONDecodeError:
+                args = {}
+        else:
+            args = dict(raw_args)
+
+        # Silently inject JWT for tools that require authentication
+        if name in _AUTH_REQUIRED_TOOLS:
+            args["jwt_token"] = jwt_token
+
         log.info("tool_invoke", extra={"tool": name, "tool_call_id": tc["id"]})
         result = await execute_tool(name, args)
         tool_messages.append(
@@ -351,14 +376,20 @@ async def run_turn(
     user_message: str,
     history: list[dict[str, Any]],
     order_params: Optional[dict[str, Any]] = None,
+    jwt_token: str = "",
 ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
     """Run a single conversational turn.
 
-    Returns:
-      (final_assistant_text, updated_history, updated_order_params)
+    Args:
+        session_id:    Unique session identifier.
+        user_message:  Latest message from the user.
+        history:       Prior conversation messages from Valkey.
+        order_params:  Accumulated order parameters from Valkey.
+        jwt_token:     JWT bearer token from the mobile app. Injected into
+                       auth-required tool calls transparently.
 
-    updated_order_params should be persisted to Valkey alongside history
-    so parameter accumulation works across turns.
+    Returns:
+        (final_assistant_text, updated_history, updated_order_params)
     """
     graph = get_graph()
     initial_messages = build_initial_messages(history, user_message)
@@ -372,6 +403,7 @@ async def run_turn(
             "order_params": order_params or {},
             "params_complete": False,
             "semantic_matches": [],
+            "jwt_token":       jwt_token,
         }
     )
 
