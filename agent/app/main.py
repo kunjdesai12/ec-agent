@@ -66,6 +66,7 @@ class ChatRequest(BaseModel):
     session_id: str = Field(..., min_length=1, max_length=128)
     message: str = Field(..., min_length=1, max_length=4000)
     user_id: Optional[str] = None
+    jwt_token: Optional[str] = None
 
 
 class ChatSyncResponse(BaseModel):

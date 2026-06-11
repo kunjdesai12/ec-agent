@@ -55,6 +55,9 @@ async def chat_complete(
         "top_p": s.top_p,
         "stream": stream,
     }
+    log.info("llm_messages", extra={
+        "messages": messages,
+    })
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = tool_choice

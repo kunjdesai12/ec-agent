@@ -18,19 +18,79 @@ log = get_logger(__name__)
 _INTENT_SYSTEM = """\
 You are an intent classifier for a food ordering assistant.
 Classify the user message into exactly one of these intents:
-- order_food       : user wants to place a new food order
+- order_food         : user wants to place a new food order
 - check_order_status : user wants to check status of an existing order
-- general          : anything else (discovery, questions, greetings, complaints)
+- cancel_intent      : user wants to cancel or start over
+- general            : anything else (discovery, questions, greetings, complaints)
 
 Respond with ONLY a JSON object, nothing else:
 {"intent": "<intent>"}
 """
 
+# Signals that the user explicitly wants to switch away from current intent
+_SWITCH_SIGNALS = {
+    "order_food": [
+        "check my order", "where is my order", "order status",
+        "track my order", "cancel", "start over", "never mind",
+    ],
+    "check_order_status": [
+        "order food", "i want to order", "place order",
+        "get me", "i'll have", "cancel", "start over", "never mind",
+    ],
+}
+
+# These always force a fresh classification regardless of sticky intent
+_ALWAYS_RECLASSIFY = [
+    "cancel", "start over", "never mind", "forget it",
+    "reset", "new order", "different order",
+]
+
+
+def _should_reclassify(user_message: str, current_intent: str) -> bool:
+    """
+    Decide whether to run the LLM classifier or reuse the sticky intent.
+
+    Returns True  → run classifier (intent may change)
+    Returns False → reuse current_intent as-is
+    """
+    lower = user_message.lower()
+
+    # Always reclassify on explicit reset phrases
+    if any(phrase in lower for phrase in _ALWAYS_RECLASSIFY):
+        return True
+
+    # Check if user is explicitly switching away from current intent
+    switch_signals = _SWITCH_SIGNALS.get(current_intent, [])
+    if any(signal in lower for signal in switch_signals):
+        return True
+
+    # Otherwise keep the sticky intent
+    return False
+
 
 async def intent_node(state: dict[str, Any]) -> dict[str, Any]:
-    """Classify user message intent."""
+    """
+    Classify user message intent with sticky intent support.
+
+    If an intent is already active (stored in order_params),
+    reuse it unless the user explicitly signals a switch.
+    This prevents mid-order messages like "yes", "2 please",
+    "14 Alkapuri" from being misclassified as 'general'.
+    """
     user_message = state["user_message"]
-    print(user_message)
+    order_params: OrderParams = state.get("order_params") or {}
+
+    # ── Sticky intent check ───────────────────────────────────────────────────
+    current_intent = order_params.get("active_intent")
+
+    if current_intent and not _should_reclassify(user_message, current_intent):
+        log.info(
+            "intent_sticky",
+            extra={"intent": current_intent, "user_msg": user_message[:80]},
+        )
+        return {"intent": current_intent}
+
+    # ── Fresh classification ──────────────────────────────────────────────────
     resp = await chat_complete(
         [
             {"role": "system", "content": _INTENT_SYSTEM},
@@ -54,8 +114,24 @@ async def intent_node(state: dict[str, Any]) -> dict[str, Any]:
         else:
             intent = "general"
 
-    log.info("intent_classified", extra={"intent": intent, "user_msg": user_message[:80]})
-    return {"intent": intent}
+    log.info(
+        "intent_classified",
+        extra={"intent": intent, "user_msg": user_message[:80]},
+    )
+
+    # ── Store active intent in order_params so it persists across turns ───────
+    # Only set/update when intent is actionable (not general/cancel)
+    if intent in ("order_food", "check_order_status"):
+        order_params["active_intent"] = intent
+    elif intent == "cancel_intent":
+        # Clear sticky intent and order params on explicit cancel
+        order_params["active_intent"] = None
+        log.info("intent_reset", extra={"reason": "cancel_intent"})
+
+    return {
+        "intent": intent,
+        "order_params": order_params,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -6,7 +6,8 @@ to Valkey as part of conversation history between turns.
 Shape:
 {
     "restaurant_name": str | None,
-    "items": [{"name": str, "quantity": int}, ...]   # may be empty
+    "items": [{"name": str, "quantity": int}, ...],
+    "active_intent": str | None   # sticky intent across turns
 }
 """
 from __future__ import annotations
@@ -22,6 +23,7 @@ class OrderItem(TypedDict):
 class OrderParams(TypedDict, total=False):
     restaurant_name: str | None
     items: list[OrderItem]
+    active_intent: str | None          # sticky intent — set by intent_node
 
 
 def merge_order_params(existing: OrderParams, extracted: dict[str, Any]) -> OrderParams:
@@ -31,6 +33,7 @@ def merge_order_params(existing: OrderParams, extracted: dict[str, Any]) -> Orde
     - restaurant_name: use extracted if non-null, else keep existing
     - items: merge by name — extracted items override existing ones with the
       same name (case-insensitive), new items are appended
+    - active_intent: always preserved from existing unless explicitly overwritten
     """
     merged: OrderParams = dict(existing)  # shallow copy
 
@@ -61,6 +64,12 @@ def merge_order_params(existing: OrderParams, extracted: dict[str, Any]) -> Orde
             existing_items.append({"name": name, "quantity": qty})
 
     merged["items"] = existing_items
+
+    # active_intent — preserve from existing, never overwrite with extracted
+    # (intent_node manages this field directly, not via merge)
+    if "active_intent" not in merged:
+        merged["active_intent"] = None
+
     return merged
 
 

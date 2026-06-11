@@ -1,4 +1,4 @@
-"""Tool registry: JSON schemas sent to the model + mock handlers.
+"""Tool registry: JSON schemas sent to the model + handlers.
 
 When you're ready to wire real services:
   - get_menu / search_food / get_restaurant_details -> business-service
@@ -13,14 +13,12 @@ from __future__ import annotations
 
 import json
 import uuid
-from wsgiref import headers
-import httpx
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional, List, Dict
 import httpx
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-import os
+
 from agent.app.config import get_settings
 
 load_dotenv()
@@ -30,11 +28,10 @@ BASE_URL = get_settings().tool_base_url
 ToolHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
-class CustomerDetails(BaseModel):
-    name: str
-    email: str
-    contact: str
-
+# class CustomerDetails(BaseModel):
+#     name: str
+#     email: str
+#     contact: str
 class DeliveryAddress(BaseModel):
     latitude: str
     longitude: str
@@ -43,18 +40,18 @@ class DeliveryAddress(BaseModel):
     state: str
     pincode: str
     AddressID: Optional[str] = "100"
- 
-class PlaceOrderInput(BaseModel):
-    restaurant_id: int = Field(..., description="Restaurant ID")
-    menu_item_ids: List[int] = Field(..., description="Menu item IDs")
-    price: float = Field(..., description="Base item price")
-    order_type: str = Field(..., description="delivery / pickup / dinein")
-    customer_details: CustomerDetails
-    delivery_address: DeliveryAddress
-    quantity: int = Field(1, description="Quantity per item")
-    is_cod: bool = Field(False, description="Cash on Delivery")
-    order_instructions: str = Field("", description="Special instructions")
-    jwt_token: str = Field(..., description="JWT bearer token")
+
+# class PlaceOrderInput(BaseModel):
+#     restaurant_id: int = Field(..., description="Restaurant ID")
+#     menu_item_ids: List[int] = Field(..., description="Menu item IDs")
+#     price: float = Field(..., description="Base item price")
+#     order_type: str = Field(..., description="delivery / pickup / dinein")
+#     customer_details: CustomerDetails
+#     delivery_address: DeliveryAddress
+#     quantity: int = Field(1, description="Quantity per item")
+#     is_cod: bool = Field(False, description="Cash on Delivery")
+#     order_instructions: str = Field("", description="Special instructions")
+#     jwt_token: str = Field(..., description="JWT bearer token")
 
 # ────────────────────────────────────────────────────────────────────────────
 # Schemas (OpenAI-compatible function schema — vLLM converts to Hermes format)
@@ -129,7 +126,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "name": "place_order",
             "description": (
                 "Create a food delivery order by creating/updating the cart, "
-                "calculating totals, and generating the final order."
+                "calculating totals, and generating the final order. "
+                "Always call get_user_addresses first to resolve delivery_address."
             ),
             "parameters": {
                 "type": "object",
@@ -154,24 +152,24 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "enum": ["delivery", "pickup", "dinein"],
                         "description": "Type of order being placed."
                     },
-                    "customer_details": {
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "description": "Customer full name."
-                            },
-                            "email": {
-                                "type": "string",
-                                "description": "Customer email address."
-                            },
-                            "phone": {
-                                "type": "string",
-                                "description": "Customer contact number."
-                            }
-                        },
-                        "required": ["name", "email", "phone"]
-                    },
+                    # "customer_details": {
+                    #     "type": "object",
+                    #     "properties": {
+                    #         "name": {
+                    #             "type": "string",
+                    #             "description": "Customer full name."
+                    #         },
+                    #         "email": {
+                    #             "type": "string",
+                    #             "description": "Customer email address."
+                    #         },
+                    #         "phone": {
+                    #             "type": "string",
+                    #             "description": "Customer contact number."
+                    #         }
+                    #     },
+                    #     "required": ["name", "email", "phone"]
+                    # },
                     "delivery_address": {
                         "type": "object",
                         "properties": {
@@ -231,19 +229,17 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "type": "string",
                         "description": "Special cooking or delivery instructions."
                     },
-                    "jwt_token": {
-                        "type": "string",
-                        "description": "JWT access token for authenticated API requests."
-                    }
+                    # "jwt_token": {
+                    #     "type": "string",
+                    #     "description": "JWT access token for authenticated API requests."
+                    # }
                 },
                 "required": [
                     "restaurant_id",
                     "menu_item_ids",
                     "price",
                     "order_type",
-                    "customer_details",
                     "delivery_address",
-                    "jwt_token"
                 ]
             }
         }
@@ -263,12 +259,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "type": "integer",
                         "description": "Unique order ID"
                     },
-                    "jwt_token": {
-                        "type": "string",
-                        "description": "JWT bearer token for authenticated user"
-                    }
+                    # "jwt_token": {
+                    #     "type": "string",
+                    #     "description": "JWT bearer token for authenticated user"
+                    # }
                 },
-                "required": ["order_id", "jwt_token"]
+                "required": ["order_id"]
             }
         }
     },
@@ -283,15 +279,20 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "items, total amount and scheduled time. "
                 "If multiple orders exist, show them to user and ask which one to cancel."
             ),
+            # "parameters": {
+            #     "type": "object",
+            #     "properties": {
+            #         "jwt_token": {
+            #             "type": "string",
+            #             "description": "JWT bearer token for the authenticated user."
+            #         }
+            #     },
+            #     "required": ["jwt_token"]
+            # }
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "jwt_token": {
-                        "type": "string",
-                        "description": "JWT bearer token for the authenticated user."
-                    }
-                },
-                "required": ["jwt_token"]
+                "properties": {},
+                "required": []
             }
         }
     },
@@ -322,12 +323,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "type": "string",
                         "description": "Reason for cancellation. Ask the user if not provided."
                     },
-                    "jwt_token": {
-                        "type": "string",
-                        "description": "JWT bearer token for the authenticated user."
-                    }
+                    # "jwt_token": {
+                    #     "type": "string",
+                    #     "description": "JWT bearer token for the authenticated user."
+                    # }
                 },
-                "required": ["order_id", "reason", "jwt_token"]
+                "required": ["order_id", "reason"]
             }
         }
     },
@@ -343,13 +344,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "jwt_token": {
-                        "type": "string",
-                        "description": "JWT bearer token for the authenticated user."
-                    }
-                },
-                "required": ["jwt_token"],
+                "properties": {},
+                "required": [],
             },
         },
     },
@@ -357,7 +353,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Mock handlers — replace bodies with real microservice calls later
+# Helpers
 # ────────────────────────────────────────────────────────────────────────────
 
 async def fetch_api(
@@ -390,8 +386,17 @@ async def fetch_api(
         response.raise_for_status()
 
         return response.json()
-    
-    
+
+
+def _auth_headers(jwt_token: str) -> dict[str, str]:
+    """Build Authorization header dict from a JWT token."""
+    return {"Authorization": f"Bearer {jwt_token}"}
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Handlers
+# ────────────────────────────────────────────────────────────────────────────
+
 async def _search_food(args: dict[str, Any]) -> dict[str, Any]:
     query = args.get("query", "")
     cuisine = args.get("cuisine")
@@ -464,7 +469,6 @@ async def _get_menu(args: dict[str, Any]) -> dict[str, Any]:
             response = await client.get(
                 f"{BASE_URL}/new-menu-item/getMenuItemsForUserByRestaurantId",
                 params=params,
-                headers=headers
             )
             
             response.raise_for_status()
@@ -527,7 +531,6 @@ async def _get_restaurant_details(args: dict[str, Any]) -> dict[str, Any]:
             response = await client.get(
                 f"{BASE_URL}/new-menu-item/getMenuItemsForUserByRestaurantId",
                 params=params,
-                headers=headers
             )
             response.raise_for_status()
             data = response.json()
@@ -536,7 +539,7 @@ async def _get_restaurant_details(args: dict[str, Any]) -> dict[str, Any]:
             operating_hours = restaurant.get("operating_hours", {})
 
             # Current time in IST
-            from datetime import datetime, timezone, timedelta
+            from datetime import timedelta
             IST = timezone(timedelta(hours=5, minutes=30))
             now = datetime.now(IST)
             current_day = now.strftime("%A").lower()      # e.g. "saturday"
@@ -584,7 +587,6 @@ async def _get_restaurant_details(args: dict[str, Any]) -> dict[str, Any]:
                 "state": restaurant.get("state"),
                 "cuisines": data.get("data", {}).get("restaurantCuisines", []),
                 "operating_hours": hours_display,
-                "raw_operating_hours": operating_hours,
                 "is_currently_open": is_currently_open,
                 "status": restaurant.get("status"),
                 "success": True
@@ -596,33 +598,26 @@ async def _get_restaurant_details(args: dict[str, Any]) -> dict[str, Any]:
             return {"error": f"Failed to fetch restaurant details: {str(e)}", "status": "failed"}
 
 
-
-async def _place_order(
-    restaurant_id: int,
-    menu_item_ids: List[int],
-    price: float,
-    order_type: str,
-    customer_details: CustomerDetails,
-    delivery_address: DeliveryAddress,
-    quantity: int = 1,
-    is_cod: bool = False,
-    order_instructions: str = "",
-    jwt_token: str = "",
-) -> Dict[str, Any]:
+async def _place_order(args: dict[str, Any]) -> dict[str, Any]:
     """Create a cart and place a food delivery order.
- 
-    Handles the full order lifecycle — cart creation, pricing, taxes,
-    delivery fees, and order generation — in a single call.
- 
-    Args:
-        restaurant_id: Restaurant ID where the order should be placed.
-        menu_item_ids: List of menu item IDs to order.
-        customer_details: Customer name, email, and contact number.
-        delivery_address: Full delivery address including coordinates and pincode.
-        quantity: Quantity applied uniformly to each menu item. Defaults to 1.
-        is_cod: Whether to use Cash on Delivery. Defaults to False (online payment).
-        order_instructions: Optional special instructions for the restaurant.
+
+    jwt_token is injected by tools_node from GraphState — never passed by the LLM.
+    customer_details are derived server-side from the JWT token.
     """
+    restaurant_id      = args.get("restaurant_id")
+    menu_item_ids      = args.get("menu_item_ids", [])
+    price              = args.get("price", 0)
+    order_type         = args.get("order_type", "delivery")
+    delivery_address   = args.get("delivery_address", {})
+    quantity           = args.get("quantity", 1)
+    is_cod             = args.get("is_cod", False)
+    order_instructions = args.get("order_instructions", "")
+    jwt_token          = args.get("jwt_token", "")
+
+    if not jwt_token:
+        return {"success": False, "error": "Authentication required. Please log in."}
+
+    headers = _auth_headers(jwt_token)
 
     cart_payload = {
         "restaurants": [
@@ -635,100 +630,108 @@ async def _place_order(
             }
         ]
     }
-    headers = {
-    "Authorization": f"Bearer {jwt_token}"
-    }
-    
-    cart_response = await fetch_api(
-        f"{BASE_URL}/new-cart/add-update",
-        method="POST",
-        json=cart_payload,
-        headers=headers
-    )
-    cart_data = cart_response.get("data", {})
-    cart_details = cart_data.get("cart_details") or cart_data.get("cart") or {}
 
-    now_utc = datetime.now(timezone.utc).isoformat()
-    order_payload = {
-        "cart_details": cart_details,
-        "customer_details": customer_details.model_dump(),
-        "delivery_address": delivery_address.model_dump(),
-        "order_type": order_type,
-        "apply_coupons": [],
-        "order_instructions": order_instructions,
-        "company_id": "",
-        "order_time": now_utc,
-        "order_placed_time": now_utc,
-        "order_tip": 0,
-        "delivery_instructions": "",
-        "loyalty_points": 0,
-        "dinein_booking_id": None,
-        "is_cod": is_cod,
-    }
-    print("Order Payload:", order_payload)
-    order_response = await fetch_api(f"{BASE_URL}/new-payment/create-order", method="POST", json=order_payload, headers=headers)
-    print("Order Response:", order_response)
- 
-    return {
-        "success": True,
-        "cart_response": cart_response,
-        "order_response": order_response,
-    }
+    try:
+        cart_response = await fetch_api(
+            f"{BASE_URL}/new-cart/add-update",
+            method="POST",
+            json=cart_payload,
+            headers=headers,
+        )
+        cart_data = cart_response.get("data", {})
+        cart_details = cart_data.get("cart_details") or cart_data.get("cart") or {}
 
+        now_utc = datetime.now(timezone.utc).isoformat()
+        order_payload = {
+            "cart_details":         cart_details,
+            "delivery_address":     delivery_address,
+            "order_type":           order_type,
+            "apply_coupons":        [],
+            "order_instructions":   order_instructions,
+            "company_id":           "",
+            "order_time":           now_utc,
+            "order_placed_time":    now_utc,
+            "order_tip":            0,
+            "delivery_instructions": "",
+            "loyalty_points":       0,
+            "dinein_booking_id":    None,
+            "is_cod":               is_cod,
+        }
 
-async def _get_order_status(
-    order_id: int,
-    jwt_token: str,
-) -> Dict[str, Any]:
-    """
-    Retrieve complete order details and live order status using an order ID.
+        print("Order Payload:", order_payload)
 
-    Useful for:
-    - order progress
-    - payment status
-    - delivery updates
-    - ordered items
-    - restaurant details
-    - tracking information
-    - customer order history
-
-    Args:
-        order_id: Unique order ID
-        jwt_token: User JWT bearer token
-    """
-
-    url = f"{BASE_URL}/order/{order_id}"
-
-    headers = {
-        "Authorization": f"Bearer {jwt_token}"
-    }
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-
-        response = await client.get(
-            url,
-            headers=headers
+        order_response = await fetch_api(
+            f"{BASE_URL}/new-payment/create-order",
+            method="POST",
+            json=order_payload,
+            headers=headers,
         )
 
-        response.raise_for_status()
+        print("Order Response:", order_response)
 
-        return response.json()
-    
+        return {
+            "success":        True,
+            "cart_response":  cart_response,
+            "order_response": order_response,
+        }
+
+    except httpx.HTTPStatusError as e:
+        try:
+            error_msg = e.response.json().get("message") or e.response.text
+        except Exception:
+            error_msg = e.response.text
+        return {"success": False, "error": f"Order failed: {error_msg}"}
+    except Exception as e:
+        return {"success": False, "error": f"Order failed: {str(e)}"}
+
+
+async def _get_order_status(args: dict[str, Any]) -> dict[str, Any]:
+    """Retrieve complete order details and live status.
+
+    jwt_token is injected by tools_node from GraphState.
+    """
+    order_id  = args.get("order_id")
+    jwt_token = args.get("jwt_token", "")
+
+    if not order_id:
+        return {"error": "order_id is required", "success": False}
+    if not jwt_token:
+        return {"error": "Authentication required. Please log in.", "success": False}
+
+    headers = _auth_headers(jwt_token)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            response = await client.get(
+                f"{BASE_URL}/order/{order_id}",
+                headers=headers,
+            )
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            return {"error": f"API Error: {e.response.status_code}", "success": False}
+        except Exception as e:
+            return {"error": f"Failed to fetch order status: {str(e)}", "success": False}
+
 
 async def _get_active_orders(args: dict[str, Any]) -> dict[str, Any]:
-    jwt_token = args.get("jwt_token")
+    """Fetch the current user's active orders.
+
+    jwt_token is injected by tools_node from GraphState.
+    """
+    jwt_token = args.get("jwt_token", "")
 
     if not jwt_token:
-        return {"error": "jwt_token is required", "success": False}
+        return {"error": "Authentication required. Please log in.", "success": False}
 
-    headers = {"Authorization": f"Bearer {jwt_token}"}
+    headers = _auth_headers(jwt_token)
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.get(
                 f"{BASE_URL}/order/user/active-order",
-                params={"order_type": "instant"},  # hardcoded — dinein not implemented yet
-                headers=headers
+                params={"order_type": "instant"},
+                headers=headers,
             )
             response.raise_for_status()
             data = response.json()
@@ -785,18 +788,22 @@ async def _get_active_orders(args: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _cancel_order(args: dict[str, Any]) -> dict[str, Any]:
+    """Cancel a food order.
+
+    jwt_token is injected by tools_node from GraphState.
+    """
     order_id  = args.get("order_id")
     reason    = args.get("reason", "").strip()
-    jwt_token = args.get("jwt_token")
+    jwt_token = args.get("jwt_token", "")
 
     if not order_id:
         return {"success": False, "error": "order_id is required."}
     if not reason:
         return {"success": False, "error": "reason is required. Please ask the user why they want to cancel."}
     if not jwt_token:
-        return {"success": False, "error": "jwt_token is required."}
+        return {"success": False, "error": "Authentication required. Please log in."}
 
-    headers = {"Authorization": f"Bearer {jwt_token}"}
+    headers = _auth_headers(jwt_token)
 
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -837,14 +844,16 @@ async def _cancel_order(args: dict[str, Any]) -> dict[str, Any]:
         return {"success": False, "cancelled": False, "error": f"Something went wrong: {str(e)}"}
 
 async def _get_user_addresses(args: dict[str, Any]) -> dict[str, Any]:
-    jwt_token = args.get("jwt_token")
+    """Fetch user's saved delivery addresses.
+
+    jwt_token is injected by tools_node from GraphState.
+    """
+    jwt_token = args.get("jwt_token", "")
 
     if not jwt_token:
-        return {"error": "jwt_token is required", "status": "failed"}
+        return {"error": "Authentication required. Please log in.", "status": "failed"}
 
-    headers = {
-        "Authorization": f"Bearer {jwt_token}"
-    }
+    headers = _auth_headers(jwt_token)
 
     async with httpx.AsyncClient(timeout=12.0) as client:
         try:
@@ -894,6 +903,10 @@ async def _get_user_addresses(args: dict[str, Any]) -> dict[str, Any]:
         except Exception as e:
             return {"error": f"Failed to fetch addresses: {str(e)}", "status": "failed"}
 
+
+# ────────────────────────────────────────────────────────────────────────────
+# Dispatch table
+# ────────────────────────────────────────────────────────────────────────────
 
 HANDLERS: dict[str, ToolHandler] = {
     "search_food": _search_food,
