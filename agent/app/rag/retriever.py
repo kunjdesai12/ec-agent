@@ -47,6 +47,7 @@ class Retriever:
     def __init__(self) -> None:
         s = get_settings()
         log.info("loading_embedding_model", extra={"model": s.embedding_model})
+        log.info("--------------------------------")
         self.model = SentenceTransformer(s.embedding_model)
         self.top_k = s.rag_top_k
         self._pg_conn_str = (
@@ -58,7 +59,7 @@ class Retriever:
         )
         self._check_connection()
         log.info("retriever_ready", extra={"backend": "pgvector"})
-
+        log.info("--------------------------------")
     def _check_connection(self) -> None:
         try:
             conn = psycopg2.connect(self._pg_conn_str)
@@ -67,8 +68,10 @@ class Retriever:
                 count = cur.fetchone()[0]
             conn.close()
             log.info("pgvector_connected", extra={"restaurant_embeddings_count": count})
+            log.info("--------------------------------")
         except Exception as e:
             log.error("pgvector_connection_failed", extra={"error": str(e)})
+            log.info("--------------------------------")
             raise
 
     def _get_conn(self):

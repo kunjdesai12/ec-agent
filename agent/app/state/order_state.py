@@ -6,7 +6,8 @@ to Valkey as part of conversation history between turns.
 Shape:
 {
     "restaurant_name": str | None,
-    "items": [{"name": str, "quantity": int}, ...],
+    "items": [{"name": str, "quantity": int,
+               "special_instructions": str | None}, ...],
     "active_intent": str | None   # sticky intent across turns
 }
 """
@@ -15,9 +16,10 @@ from __future__ import annotations
 from typing import Any, TypedDict
 
 
-class OrderItem(TypedDict):
+class OrderItem(TypedDict, total=False):
     name: str
     quantity: int
+    special_instructions: str | None    # optional — e.g. "extra spicy", "no onions"
 
 
 class OrderParams(TypedDict, total=False):
@@ -26,13 +28,23 @@ class OrderParams(TypedDict, total=False):
     active_intent: str | None          # sticky intent — set by intent_node
 
 
+def _clean_instructions(value: Any) -> str | None:
+    """Normalize special_instructions to a non-empty string or None."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s or None
+
+
 def merge_order_params(existing: OrderParams, extracted: dict[str, Any]) -> OrderParams:
     """Merge newly extracted params on top of existing accumulated params.
 
     Rules:
     - restaurant_name: use extracted if non-null, else keep existing
     - items: merge by name — extracted items override existing ones with the
-      same name (case-insensitive), new items are appended
+      same name (case-insensitive). Quantity is replaced. special_instructions
+      is replaced if explicitly provided in extracted (including empty string,
+      which clears it); otherwise preserved.
     - active_intent: always preserved from existing unless explicitly overwritten
     """
     merged: OrderParams = dict(existing)  # shallow copy
@@ -48,7 +60,6 @@ def merge_order_params(existing: OrderParams, extracted: dict[str, Any]) -> Orde
     existing_items: list[OrderItem] = list(merged.get("items") or [])
     new_items: list[dict] = extracted.get("items") or []
 
-    # Build lookup of existing items by lowercase name
     existing_by_name = {item["name"].lower(): i for i, item in enumerate(existing_items)}
 
     for new_item in new_items:
@@ -56,17 +67,26 @@ def merge_order_params(existing: OrderParams, extracted: dict[str, Any]) -> Orde
         qty = int(new_item.get("quantity") or 1)
         if not name:
             continue
+
+        # Only treat special_instructions as "provided" if the key is present
+        instr_provided = "special_instructions" in new_item
+        instr_value = _clean_instructions(new_item.get("special_instructions"))
+
         key = name.lower()
         if key in existing_by_name:
-            # Update quantity if re-specified
-            existing_items[existing_by_name[key]]["quantity"] = qty
+            idx = existing_by_name[key]
+            existing_items[idx]["quantity"] = qty
+            if instr_provided:
+                existing_items[idx]["special_instructions"] = instr_value
         else:
-            existing_items.append({"name": name, "quantity": qty})
+            item: OrderItem = {"name": name, "quantity": qty}
+            if instr_provided:
+                item["special_instructions"] = instr_value
+            existing_items.append(item)
 
     merged["items"] = existing_items
 
     # active_intent — preserve from existing, never overwrite with extracted
-    # (intent_node manages this field directly, not via merge)
     if "active_intent" not in merged:
         merged["active_intent"] = None
 

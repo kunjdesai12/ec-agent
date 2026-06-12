@@ -44,7 +44,11 @@ class Settings(BaseSettings):
     pg_user: str = "vectoradmin"
     pg_password: str = "vector123"  # set via PG_PASSWORD env var or .env
     use_memory_store: bool = True
-    tool_base_url: str = "http://localhost:3002"
+    tool_base_url: str = "https://restaurant.techxsolutions.in/user/v1"
+    stt_api_endpoint: str = "http://localhost:8002/transcribe/sync"
+
+    # user backend
+    backend_base_url: str = "https://restaurant.techxsolutions.in/user/v1"
 
 @lru_cache
 def get_settings() -> Settings:

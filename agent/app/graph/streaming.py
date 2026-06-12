@@ -31,6 +31,8 @@ async def stream_turn(
     session_id: str,
     user_message: str,
     history: list[dict[str, Any]],
+    order_params: Optional[dict[str, Any]] = None,
+    jwt_token: str = "",
 ) -> AsyncIterator[dict[str, Any]]:
     """Yield SSE-friendly events for a turn.
 

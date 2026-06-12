@@ -14,7 +14,7 @@ import urllib.request
 import urllib.error
 from datetime import datetime
 
-BASE_URL   = "http://localhost:7000"
+BASE_URL   = "http://localhost:8000"
 RESET_URL  = BASE_URL + "/v1/session/{sid}/reset"
 CHAT_URL   = BASE_URL + "/v1/chat/sync"
 HEALTH_URL = BASE_URL + "/v1/health"
@@ -56,8 +56,12 @@ def get(url):
 
 # ── Core chat call ────────────────────────────────────────────────────────────
 
-def chat(session_id, message):
-    result, err = post(CHAT_URL, {"session_id": session_id, "message": message})
+def chat(session_id, message, jwt_token=""):
+    result, err = post(CHAT_URL, {
+        "session_id": session_id,
+        "message":    message,
+        "jwt_token":  jwt_token,
+    })
     if err:
         return None, err
     return result.get("text", ""), None
@@ -73,6 +77,59 @@ def reset_session(session_id):
     except Exception:
         return False
 
+def send_otp(phone, country_code="+91"):
+    result, err = post(BASE_URL + "/auth/send-otp", {
+        "phone": phone,
+        "country_code": country_code,
+    })
+    return result, err
+
+
+def verify_otp(phone, otp, country_code="+91"):
+    result, err = post(BASE_URL + "/auth/verify-otp", {
+        "phone": phone,
+        "otp": otp,
+        "country_code": country_code,
+    })
+    return result, err
+
+def login_flow():
+    """Ask for phone, send OTP, ask for OTP, return token."""
+    print(c(B, "\n  ── Login ──────────────────────────────────────────"))
+    phone = input(c(GR, "  Phone number: ")).strip()
+    if not phone:
+        print(c(RD, "  ✗ Phone number required."))
+        sys.exit(1)
+
+    print(c(DM, f"  Sending OTP to {phone}..."))
+    result, err = send_otp(phone)
+    if err:
+        print(c(RD, f"  ✗ Failed to send OTP: {err}"))
+        sys.exit(1)
+    print(c(GR, f"  ✓ {result.get('message', 'OTP sent')}"))
+
+    otp = input(c(GR, "  Enter OTP: ")).strip()
+    if not otp:
+        print(c(RD, "  ✗ OTP required."))
+        sys.exit(1)
+
+    print(c(DM, "  Verifying OTP..."))
+    result, err = verify_otp(phone, otp)
+    if err:
+        print(c(RD, f"  ✗ OTP verification failed: {err}"))
+        sys.exit(1)
+
+    token = result.get("token")
+    name  = result.get("name", "User")
+    uid   = result.get("user_id")
+
+    if not token:
+        print(c(RD, "  ✗ No token received."))
+        sys.exit(1)
+
+    print(c(GR, f"  ✓ Logged in as {name} (user_id: {uid})"))
+    print(c(B,  "  ───────────────────────────────────────────────────\n"))
+    return token
 
 # ── Health check ──────────────────────────────────────────────────────────────
 
@@ -116,7 +173,7 @@ TEST_SUITE = [
 ]
 
 
-def run_suite(session_id):
+def run_suite(session_id, jwt_token=""):
     print(f"\n{c(B, '═' * 58)}")
     print(c(B, "  AKI TEST SUITE"))
     print(c(B, '═' * 58))
@@ -131,7 +188,7 @@ def run_suite(session_id):
         print(f"  {c(YL, label)}")
         print(f"  {c(DM, '▶')} {message}")
 
-        response, err = chat(session_id, message)
+        response, err = chat(session_id, message, jwt_token)
 
         if err:
             print(f"  {c(RD, '✗ ERROR:')} {err}")
@@ -182,7 +239,7 @@ COMMANDS = {
 }
 
 
-def interactive(session_id):
+def interactive(session_id, jwt_token=""):
     print(f"\n{c(B, '═' * 58)}")
     print(c(B, "  AKI INTERACTIVE TEST"))
     print(c(B, '═' * 58))
@@ -226,7 +283,7 @@ def interactive(session_id):
             continue
 
         if user_input == "/suite":
-            run_suite(f"suite-{datetime.now().strftime('%H%M%S')}")
+            run_suite(f"suite-{datetime.now().strftime('%H%M%S')}", jwt_token)
             continue
 
         if user_input == "/help":
@@ -237,7 +294,7 @@ def interactive(session_id):
 
         # ── Chat ──────────────────────────────────────────────
         t_start = datetime.now()
-        response, err = chat(session_id, user_input)
+        response, err = chat(session_id, user_input, jwt_token)
         elapsed = (datetime.now() - t_start).total_seconds()
 
         if err:
@@ -260,15 +317,18 @@ def main():
     print(f"\n{c(B+CY, '  Aki Test Script')}")
     print(f"  {c(DM, BASE_URL)}\n")
 
+    # Login first — get JWT before anything else
+    jwt_token = login_flow()
+
     print(c(DM, "  Checking server health..."))
     check_health()
     print()
 
     if args.suite:
-        ok = run_suite(args.session)
+        ok = run_suite(args.session, jwt_token)
         sys.exit(0 if ok else 1)
     else:
-        interactive(args.session)
+        interactive(args.session, jwt_token)
 
 
 if __name__ == "__main__":

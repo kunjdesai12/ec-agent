@@ -139,19 +139,23 @@ async def intent_node(state: dict[str, Any]) -> dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _EXTRACT_SYSTEM = """\
-You are a parameter extractor for a food ordering assistant.
-Extract order parameters from the user message and conversation history.
-
 Extract:
 - restaurant_name : name of the restaurant (string or null)
-- items           : list of objects with {name: string, quantity: integer}
-                    quantity defaults to 1 if not specified
-                    can be multiple items
+- items           : list of objects with:
+                      - name: string
+                      - quantity: integer (defaults to 1)
+                      - special_instructions: string or null
+                        (e.g. "extra spicy", "no onions", "less oil")
+                    Only include special_instructions if the user explicitly
+                    said something about how the item should be prepared.
 
 Return ONLY a JSON object, nothing else:
 {
   "restaurant_name": "<name or null>",
-  "items": [{"name": "<item>", "quantity": <int>}, ...]
+  "items": [
+    {"name": "<item>", "quantity": <int>, "special_instructions": "<str or null>"},
+    ...
+  ]
 }
 
 If a field is not mentioned, use null for restaurant_name and [] for items.
