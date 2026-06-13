@@ -1,12 +1,14 @@
-"""bge-m3 retriever backed by pgvector (RDS Postgres).
+"""pgvector + static-rule retriever for EasyCater Aki.
 
-Replaces the in-memory numpy corpus with a Postgres vector search.
-The search_menu() SQL function handles:
-  - cosine similarity via pgvector <=> operator
-  - cuisine / price / geo-distance filters
-  - top-k ranking
+Restaurant and item resolution uses deterministic SQL rules (exact → contains →
+trigram) rather than vector similarity. Vector search is reserved for pure
+discovery queries where no restaurant or item name is known.
 
-All heavy lifting stays in Postgres — no embeddings loaded into RAM.
+Matching hierarchy (applied in order, stops at first hit):
+  1. Exact match         LOWER(col) = LOWER(input)
+  2. Contains match      LOWER(col) LIKE '%input%'
+  3. Trigram match       pg_trgm similarity() > threshold
+  4. Not found           → tell user, do not proceed
 """
 from __future__ import annotations
 
@@ -23,6 +25,15 @@ from agent.app.logging_setup import get_logger
 
 log = get_logger(__name__)
 
+# Trigram similarity threshold for fuzzy name matching.
+# 0.3 is permissive enough for "honest" → "Honest Restaurant" and
+# typos like "honnest", but won't match totally unrelated names.
+_RESTAURANT_TRGM_THRESHOLD = 0.3
+_ITEM_TRGM_THRESHOLD       = 0.3
+
+# Minimum vector similarity for pure discovery queries (no name known).
+_VECTOR_SIM_THRESHOLD = 0.50
+
 
 @dataclass
 class MenuChunk:
@@ -33,7 +44,7 @@ class MenuChunk:
     item_id:         str
     item_name:       str
     price:           float
-    text:            str          # combined_text from DB
+    text:            str
     description:     str = ""
     rating:          Optional[float] = None
     latitude:        Optional[float] = None
@@ -42,14 +53,10 @@ class MenuChunk:
 
 
 class Retriever:
-    """pgvector-backed bge-m3 retriever."""
+    """Static-rule retriever with pgvector fallback for discovery."""
 
     def __init__(self) -> None:
         s = get_settings()
-        log.info("loading_embedding_model", extra={"model": s.embedding_model})
-        log.info("--------------------------------")
-        self.model = SentenceTransformer(s.embedding_model)
-        self.top_k = s.rag_top_k
         self._pg_conn_str = (
             f"host={s.pg_host} "
             f"dbname={s.pg_db} "
@@ -57,133 +64,384 @@ class Retriever:
             f"password={s.pg_password} "
             f"port={s.pg_port}"
         )
+        self.top_k = s.rag_top_k
+
+        # Embedding model — only used for discovery (no restaurant/item name)
+        log.info("loading_embedding_model", extra={"model": s.embedding_model})
+        self.model = SentenceTransformer(s.embedding_model)
+
         self._check_connection()
-        log.info("retriever_ready", extra={"backend": "pgvector"})
-        log.info("--------------------------------")
+        log.info("retriever_ready", extra={"backend": "pgvector+static"})
+
     def _check_connection(self) -> None:
         try:
             conn = psycopg2.connect(self._pg_conn_str)
             with conn.cursor() as cur:
                 cur.execute("SELECT COUNT(*) FROM restaurant_embeddings")
                 count = cur.fetchone()[0]
+                # Confirm pg_trgm is available
+                cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'")
+                has_trgm = cur.fetchone() is not None
             conn.close()
-            log.info("pgvector_connected", extra={"restaurant_embeddings_count": count})
-            log.info("--------------------------------")
+            log.info("pgvector_connected", extra={
+                "rows": count,
+                "pg_trgm": has_trgm,
+            })
+            if not has_trgm:
+                log.warning("pg_trgm_missing", extra={
+                    "hint": "Run: CREATE EXTENSION pg_trgm; as superuser"
+                })
         except Exception as e:
             log.error("pgvector_connection_failed", extra={"error": str(e)})
-            log.info("--------------------------------")
             raise
 
     def _get_conn(self):
         return psycopg2.connect(self._pg_conn_str)
+
+    # ── Public API ────────────────────────────────────────────────────────────
 
     async def search(
         self,
         query: str,
         *,
         top_k: Optional[int] = None,
+        restaurant_name: Optional[str] = None,
+        menu_item: Optional[str] = None,
+        restaurant_id: Optional[str] = None,
         cuisine: Optional[str] = None,
         max_price: Optional[float] = None,
         user_lat: Optional[float] = None,
         user_lon: Optional[float] = None,
         max_distance_km: Optional[float] = 10.0,
-        restaurant_name: Optional[str] = None,
-        menu_item: Optional[str] = None,
     ) -> list[MenuChunk]:
-        """Embed query and search pgvector for similar menu items."""
         k = top_k or self.top_k
 
-        # Build field map — which columns to search and with what embeddings
-        fields = {}
+        # ── Path A: restaurant_id already known — static item lookup ──────────
+        if restaurant_id and menu_item:
+            return await asyncio.to_thread(
+                self._find_items_in_restaurant,
+                restaurant_id, menu_item, k
+            )
+
+        # ── Path A2: restaurant_id known, no item — sample the menu ──────────
+        if restaurant_id and not menu_item:
+            return await asyncio.to_thread(
+                self._sample_restaurant_menu, restaurant_id, k
+            )
+
+        # ── Path B: restaurant name known — static restaurant match first ─────
         if restaurant_name:
-            emb = await asyncio.to_thread(
-                self.model.encode, [restaurant_name],
-                normalize_embeddings=True, convert_to_numpy=True
+            matched = await asyncio.to_thread(
+                self._find_restaurant, restaurant_name
             )
-            fields["restaurant_name"] = ("restaurant_name_embedding", emb[0])
+            if not matched:
+                return []   # caller interprets empty as not found
+
+            rid, rname = matched
+
+            if menu_item:
+                # Scoped item search within the matched restaurant
+                return await asyncio.to_thread(
+                    self._find_items_in_restaurant, rid, menu_item, k
+                )
+            else:
+                # No specific item — return a sample of the restaurant's menu
+                return await asyncio.to_thread(
+                    self._sample_restaurant_menu, rid, k
+                )
+
+        # ── Path C: item name known, no restaurant — find who serves it ───────
         if menu_item:
-            emb = await asyncio.to_thread(
-                self.model.encode, [menu_item],
-                normalize_embeddings=True, convert_to_numpy=True
+            return await asyncio.to_thread(
+                self._find_item_across_restaurants, menu_item, cuisine, k
             )
-            fields["menu_item"] = ("food_item_embedding", emb[0])
-        if cuisine:
-            emb = await asyncio.to_thread(
-                self.model.encode, [cuisine],
-                normalize_embeddings=True, convert_to_numpy=True
-            )
-            fields["cuisine"] = ("cuisine_embedding", emb[0])
 
-        # Fall back to combined_text search if no structured fields detected
-        if not fields:
-            q_emb = await asyncio.to_thread(
-                self.model.encode,
-                [query],  
-                normalize_embeddings=True,
-                convert_to_numpy=True,
-            )
-            fields["combined"] = ("embedding", q_emb[0])
+        # ── Path D: pure discovery — vector search over combined_text ─────────
+        return await self._vector_search(query, cuisine, max_price, k)
 
-        results = await asyncio.to_thread(
-            self._query_field_aware,
-            fields, max_price, user_lat, user_lon, max_distance_km, k
-        )
-        return results
+    # ── Static SQL helpers ────────────────────────────────────────────────────
 
-    def _query_field_aware(self, fields, max_price, user_lat, user_lon, max_distance_km, k):
+    def _find_restaurant(self, name: str) -> Optional[tuple[str, str]]:
+        """Return (restaurant_id, restaurant_name) or None.
+
+        Tries in order:
+          1. Exact case-insensitive match
+          2. Contains match (input is substring of stored name)
+          3. Trigram similarity above threshold
+        """
         conn = self._get_conn()
-        scores = {}  # menu_item_id → {row, total_sim, field_count}
-
         try:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                for field_name, (col, emb) in fields.items():
-                    emb_str = "[" + ",".join(f"{v:.6f}" for v in emb.tolist()) + "]"
-                    cur.execute(f"""
-                        SELECT *,
-                            1 - ({col} <=> %s::vector) AS similarity
-                        FROM restaurant_embeddings
-                        WHERE
-                            (%s IS NULL OR price <= %s)
-                            AND (%s IS NULL OR %s IS NULL OR
-                                6371 * acos(LEAST(1.0,
-                                    cos(radians(%s::float)) * cos(radians(latitude::float)) *
-                                    cos(radians(longitude::float) - radians(%s::float)) +
-                                    sin(radians(%s::float)) * sin(radians(latitude::float))
-                                )) <= %s)
-                        ORDER BY {col} <=> %s::vector
-                        LIMIT %s
-                    """, (
-                        emb_str,
-                        max_price, max_price,
-                        user_lat, user_lon, user_lat, user_lon, user_lat, max_distance_km,
-                        emb_str, k * 3
-                    ))
-                    rows = cur.fetchall()
-                    for row in rows:
-                        mid = row["menu_item_id"]
-                        if mid not in scores:
-                            scores[mid] = {"row": row, "total_sim": 0.0, "field_count": 0}
-                        scores[mid]["total_sim"] += float(row["similarity"])
-                        scores[mid]["field_count"] += 1
+            with conn.cursor() as cur:
+                # 1. Exact
+                cur.execute("""
+                    SELECT DISTINCT restaurant_id, restaurant_name
+                    FROM restaurant_embeddings
+                    WHERE LOWER(restaurant_name) = LOWER(%s)
+                    LIMIT 1
+                """, (name,))
+                row = cur.fetchone()
+                if row:
+                    log.info("restaurant_match_exact", extra={"input": name, "matched": row[1]})
+                    return str(row[0]), row[1]
+
+                # 2. Contains
+                cur.execute("""
+                    SELECT DISTINCT restaurant_id, restaurant_name
+                    FROM restaurant_embeddings
+                    WHERE LOWER(restaurant_name) LIKE LOWER(%s)
+                    LIMIT 1
+                """, (f"%{name}%",))
+                row = cur.fetchone()
+                if row:
+                    log.info("restaurant_match_contains", extra={"input": name, "matched": row[1]})
+                    return str(row[0]), row[1]
+
+                # 3. Trigram
+                cur.execute("""
+                    SELECT DISTINCT restaurant_id, restaurant_name,
+                           similarity(LOWER(restaurant_name), LOWER(%s)) AS sim
+                    FROM restaurant_embeddings
+                    WHERE similarity(LOWER(restaurant_name), LOWER(%s)) > %s
+                    ORDER BY sim DESC
+                    LIMIT 1
+                """, (name, name, _RESTAURANT_TRGM_THRESHOLD))
+                row = cur.fetchone()
+                if row:
+                    log.info("restaurant_match_trigram", extra={
+                        "input": name, "matched": row[1], "similarity": round(row[2], 3)
+                    })
+                    return str(row[0]), row[1]
+
+                log.info("restaurant_not_matched", extra={"input": name})
+                return None
         finally:
             conn.close()
 
-        # Average similarity, penalize rows that only matched some fields
-        n_fields = len(fields)
-        merged = []
-        for mid, data in scores.items():
-            avg_sim = data["total_sim"] / n_fields
-            if data["field_count"] < n_fields:
-                avg_sim *= 0.7  # penalty for partial match — same as semantic_search.py
-            row = dict(data["row"])
-            row["similarity"] = round(avg_sim, 6)
-            merged.append(row)
+    def _find_items_in_restaurant(
+        self, restaurant_id: str, item_name: str, k: int
+    ) -> list[MenuChunk]:
+        """Find menu items within a specific restaurant.
 
-        merged.sort(key=lambda x: x["similarity"], reverse=True)
+        Tries in order:
+          1. Exact match on food_item
+          2. Contains match
+          3. Trigram similarity above threshold
+        Returns empty list if nothing found above threshold.
+        """
+        conn = self._get_conn()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # 1. Exact
+                cur.execute("""
+                    SELECT * FROM restaurant_embeddings
+                    WHERE restaurant_id = %s
+                      AND LOWER(food_item) = LOWER(%s)
+                    LIMIT %s
+                """, (restaurant_id, item_name, k))
+                rows = cur.fetchall()
+                if rows:
+                    log.info("item_match_exact", extra={
+                        "restaurant_id": restaurant_id, "item": item_name, "n": len(rows)
+                    })
+                    return self._rows_to_chunks(rows, match_type="exact")
 
-        # Convert to MenuChunk
+                # 2. Contains
+                cur.execute("""
+                    SELECT * FROM restaurant_embeddings
+                    WHERE restaurant_id = %s
+                      AND LOWER(food_item) LIKE LOWER(%s)
+                    LIMIT %s
+                """, (restaurant_id, f"%{item_name}%", k))
+                rows = cur.fetchall()
+                if rows:
+                    log.info("item_match_contains", extra={
+                        "restaurant_id": restaurant_id, "item": item_name, "n": len(rows)
+                    })
+                    return self._rows_to_chunks(rows, match_type="contains")
+
+                # 3. Trigram
+                cur.execute("""
+                    SELECT *,
+                           similarity(LOWER(food_item), LOWER(%s)) AS trgm_sim
+                    FROM restaurant_embeddings
+                    WHERE restaurant_id = %s
+                      AND similarity(LOWER(food_item), LOWER(%s)) > %s
+                    ORDER BY trgm_sim DESC
+                    LIMIT %s
+                """, (item_name, restaurant_id, item_name, _ITEM_TRGM_THRESHOLD, k))
+                rows = cur.fetchall()
+                if rows:
+                    log.info("item_match_trigram", extra={
+                        "restaurant_id": restaurant_id,
+                        "item": item_name,
+                        "n": len(rows),
+                        "top_sim": round(float(rows[0]["trgm_sim"]), 3),
+                    })
+                    return self._rows_to_chunks(rows, match_type="trigram")
+
+                log.info("item_not_found_in_restaurant", extra={
+                    "restaurant_id": restaurant_id, "item": item_name
+                })
+                return []
+        finally:
+            conn.close()
+
+    def _find_item_across_restaurants(
+        self, item_name: str, cuisine: Optional[str], k: int
+    ) -> list[MenuChunk]:
+        """Find an item across all restaurants (no restaurant scope).
+
+        Same exact → contains → trigram hierarchy.
+        Cuisine filter applied when provided.
+        Returns up to k results, one per restaurant preferred.
+        """
+        conn = self._get_conn()
+        cuisine_clause = "AND LOWER(cuisine_name) = LOWER(%s)" if cuisine else ""
+
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                params_base = [item_name]
+                if cuisine:
+                    params_base.append(cuisine)
+
+                # 1. Exact
+                cur.execute(f"""
+                    SELECT * FROM restaurant_embeddings
+                    WHERE LOWER(food_item) = LOWER(%s)
+                    {cuisine_clause}
+                    ORDER BY rating DESC NULLS LAST
+                    LIMIT %s
+                """, (*params_base, k * 3))
+                rows = cur.fetchall()
+
+                # 2. Contains
+                if not rows:
+                    cur.execute(f"""
+                        SELECT * FROM restaurant_embeddings
+                        WHERE LOWER(food_item) LIKE LOWER(%s)
+                        {cuisine_clause}
+                        ORDER BY rating DESC NULLS LAST
+                        LIMIT %s
+                    """, (f"%{item_name}%", *(params_base[1:]), k * 3))
+                    rows = cur.fetchall()
+
+                # 3. Trigram
+                if not rows:
+                    trgm_params = [item_name, item_name, _ITEM_TRGM_THRESHOLD]
+                    if cuisine:
+                        trgm_params.append(cuisine)
+                    cur.execute(f"""
+                        SELECT *,
+                               similarity(LOWER(food_item), LOWER(%s)) AS trgm_sim
+                        FROM restaurant_embeddings
+                        WHERE similarity(LOWER(food_item), LOWER(%s)) > %s
+                        {cuisine_clause}
+                        ORDER BY trgm_sim DESC, rating DESC NULLS LAST
+                        LIMIT %s
+                    """, (*trgm_params, k * 3))
+                    rows = cur.fetchall()
+
+                if not rows:
+                    log.info("item_not_found_anywhere", extra={"item": item_name})
+                    return []
+
+                # Deduplicate — keep highest-rated item per restaurant
+                seen: set = set()
+                deduped = []
+                for row in rows:
+                    rid = row["restaurant_id"]
+                    if rid not in seen:
+                        seen.add(rid)
+                        deduped.append(row)
+                    if len(deduped) >= k:
+                        break
+
+                log.info("item_found_across_restaurants", extra={
+                    "item": item_name, "n_restaurants": len(deduped)
+                })
+                return self._rows_to_chunks(deduped, match_type="cross_restaurant")
+        finally:
+            conn.close()
+
+    def _sample_restaurant_menu(self, restaurant_id: str, k: int) -> list[MenuChunk]:
+        """Return a sample of a restaurant's menu when no item is specified."""
+        conn = self._get_conn()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT * FROM restaurant_embeddings
+                    WHERE restaurant_id = %s
+                    ORDER BY rating DESC NULLS LAST
+                    LIMIT %s
+                """, (restaurant_id, k))
+                rows = cur.fetchall()
+                return self._rows_to_chunks(rows, match_type="menu_sample")
+        finally:
+            conn.close()
+
+    # ── Vector search (discovery only) ────────────────────────────────────────
+
+    async def _vector_search(
+        self,
+        query: str,
+        cuisine: Optional[str],
+        max_price: Optional[float],
+        k: int,
+    ) -> list[MenuChunk]:
+        """Pure semantic search — used only when no restaurant or item name known."""
+        q_emb = await asyncio.to_thread(
+            self.model.encode,
+            [query],
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )
+        emb_str = "[" + ",".join(f"{v:.6f}" for v in q_emb[0].tolist()) + "]"
+
+        return await asyncio.to_thread(
+            self._vector_query, emb_str, cuisine, max_price, k
+        )
+
+    def _vector_query(
+        self,
+        emb_str: str,
+        cuisine: Optional[str],
+        max_price: Optional[float],
+        k: int,
+    ) -> list[MenuChunk]:
+        conn = self._get_conn()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT *,
+                        1 - (embedding <=> %s::vector) AS similarity
+                    FROM restaurant_embeddings
+                    WHERE
+                        (%s IS NULL OR price <= %s)
+                        AND (%s IS NULL OR LOWER(cuisine_name) = LOWER(%s))
+                        AND 1 - (embedding <=> %s::vector) >= %s
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                """, (
+                    emb_str,
+                    max_price, max_price,
+                    cuisine, cuisine,
+                    emb_str, _VECTOR_SIM_THRESHOLD,
+                    emb_str, k,
+                ))
+                rows = cur.fetchall()
+                log.info("vector_search_done", extra={"n": len(rows), "query_len": len(emb_str)})
+                return self._rows_to_chunks(rows, match_type="vector")
+        finally:
+            conn.close()
+
+    # ── Shared row → MenuChunk converter ─────────────────────────────────────
+
+    def _rows_to_chunks(
+        self, rows: list[dict], match_type: str = "unknown"
+    ) -> list[MenuChunk]:
         chunks = []
-        for row in merged[:k]:
+        for row in rows:
+            sim = float(row.get("trgm_sim", row.get("similarity", 1.0)))
             chunks.append(MenuChunk(
                 chunk_id        = str(row["menu_item_id"]),
                 restaurant_id   = str(row["restaurant_id"]),
@@ -196,12 +454,13 @@ class Retriever:
                 rating          = float(row["rating"]) if row["rating"] else None,
                 latitude        = float(row["latitude"]) if row["latitude"] else None,
                 longitude       = float(row["longitude"]) if row["longitude"] else None,
-                metadata        = {"similarity": float(row["similarity"])},
+                metadata        = {"similarity": sim, "match_type": match_type},
             ))
         return chunks
 
 
-# Module-level singleton
+# ── Module-level singleton ─────────────────────────────────────────────────
+
 _retriever: Optional[Retriever] = None
 
 
@@ -213,16 +472,32 @@ def get_retriever() -> Retriever:
 
 
 def format_chunks_for_prompt(chunks: list[MenuChunk]) -> str:
-    """Render retrieved chunks as a compact context block for the LLM."""
+    """Render retrieved chunks as a hard constraint block for the LLM."""
     if not chunks:
-        return "No relevant menu items found."
-    lines = ["Relevant menu items:"]
-    for c in chunks:
-        similarity = c.metadata.get("similarity", 0)
-        rating_str = f" ⭐{c.rating:.1f}" if c.rating else ""
-        lines.append(
-            f"- [{c.restaurant_id} / {c.item_id}] {c.item_name} @ {c.restaurant_name} "
-            f"({c.cuisine}) — ₹{c.price:.0f}{rating_str} "
-            f"[similarity: {similarity:.2f}]"
+        return (
+            "AVAILABLE ITEMS: none found matching this request.\n"
+            "Do NOT suggest or invent any menu items. Tell the user nothing "
+            "was found and offer to search elsewhere."
         )
-    return "\n".join(lines)
+
+    by_restaurant: dict[str, list[MenuChunk]] = {}
+    for c in chunks:
+        by_restaurant.setdefault(c.restaurant_name, []).append(c)
+
+    lines = [
+        "AVAILABLE ITEMS — these are the ONLY real items you may mention or order.",
+        "Do NOT mention, suggest, or order any item not listed here.",
+        "If the user asked for something not in this list, say it is not available "
+        "and suggest from this list.",
+        "",
+    ]
+    for restaurant_name, items in by_restaurant.items():
+        lines.append(f"Restaurant: {items[0].restaurant_name} (ID: {items[0].restaurant_id})")
+        for c in items:
+            rating_str = f" \u2b50{c.rating:.1f}" if c.rating else ""
+            lines.append(
+                f"  - {c.item_name} | item_id={c.item_id} | \u20b9{c.price:.0f}{rating_str}"
+            )
+        lines.append("")
+
+    return "\n".join(lines).strip()

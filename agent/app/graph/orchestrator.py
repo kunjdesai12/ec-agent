@@ -17,45 +17,54 @@ Flow:
   complete?            │                │
     ├─ no → END        │                │
     │  (ask user)      │                │
-    └─ yes             │                │
-         ▼             ▼                ▼
-  ┌──────────────────────────────────────┐
-  │             retrieve                 │  (bge-m3 over menu corpus)
-  └──────────────────┬───────────────────┘
-                     │
-    order_food only  │
-         ▼           │
-  ┌──────────────┐   │
-  │semantic_match│   │  (resolves names → real IDs via pgvector)
-  └──────┬───────┘   │
-         └───────────┘
-                     ▼
-              ┌──────────────┐
-              │     llm      │◀────────────┐
-              └──────┬───────┘             │
-                     │                     │
-            tool_calls?                    │
-               ├─ yes ─▶ ┌──────────────┐ │
-               │         │    tools     │ │
-               │         └──────┬───────┘ │
-               │                └─────────┘
-               └─ no ──▶ END
+    └─ yes             ▼                ▼
+                ┌──────────────────────────────────────┐
+                │             retrieve                  │
+                │  bge-m3 over menu corpus              │
+                │  uses order_params filters when set   │
+                └──────────────────┬───────────────────┘
+                                   ▼
+                            ┌──────────────┐
+                            │     llm      │◀────────────┐
+                            └──────┬───────┘             │
+                                   │                     │
+                          tool_calls?                    │
+                             ├─ yes ─▶ ┌──────────────┐ │
+                             │         │    tools     │ │
+                             │         └──────┬───────┘ │
+                             │                └─────────┘
+                             └─ no ──▶ END
+
+Message hygiene contract
+────────────────────────
+state["messages"] contains ONLY:
+  • system prompt (position 0)
+  • prior user/assistant/tool turns from Valkey history
+  • the current user message
+  • assistant + tool messages produced during the llm↔tools loop
+
+It NEVER contains:
+  • intent classifier output
+  • collect_params clarifying questions   ← these go to final_text only;
+                                            run_turn() writes them to Valkey
+                                            history after ainvoke() returns
+  • ephemeral RAG system injections       ← injected into a local copy inside
+                                            llm_node, never appended to state
 """
 from __future__ import annotations
 
 import json
-from typing import Annotated, Any, Optional, TypedDict
 import re
+from typing import Annotated, Any, Optional, TypedDict
 
 from langgraph.graph import StateGraph, END
 
 from agent.app.config import get_settings
 from agent.app.graph.intent import intent_node, collect_params_node
 from agent.app.graph.prompts import AKI_SYSTEM_PROMPT
-from agent.app.graph.semantic_match import semantic_match_node
 from agent.app.llm import chat_complete
 from agent.app.logging_setup import get_logger
-from agent.app.rag import format_chunks_for_prompt, get_retriever
+from agent.app.rag.retriever import format_chunks_for_prompt, get_retriever
 from agent.app.tools import TOOL_SCHEMAS, execute_tool
 
 log = get_logger(__name__)
@@ -89,12 +98,12 @@ class GraphState(TypedDict, total=False):
     order_params: dict[str, Any]         # {restaurant_name, items: [{name, quantity}]}
     params_complete: bool
 
-    # Semantic match results
-    semantic_matches: list[dict[str, Any]]
-
     # Loop guard + output
     tool_iterations: int
     final_text: str
+
+    # Set by retrieve_node when a named restaurant couldn't be matched
+    restaurant_not_found: bool
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -118,6 +127,7 @@ Return ONLY valid JSON, nothing else.
 {"restaurant_name": "..or null", "menu_item": "..or null", "cuisine": "..or null"}
 """
 
+
 async def _extract_query_fields(user_message: str) -> dict:
     resp = await chat_complete(
         [
@@ -137,41 +147,196 @@ async def _extract_query_fields(user_message: str) -> dict:
 
 
 async def retrieve_node(state: GraphState) -> dict[str, Any]:
+    """Menu retrieval using static rules (exact → contains → trigram).
+
+    The retriever handles all matching logic internally. This node is
+    responsible for:
+      - Resolving restaurant_name and menu_item from order_params or LLM extraction
+      - Interpreting empty results as not-found and short-circuiting to END
+      - Presenting restaurant choices when item is known but restaurant isn't
+      - Passing confirmed chunks to LLM as RAG context
+    """
     query = state["user_message"]
-
-    # Extract structured fields from the query
-    extracted = await _extract_query_fields(query)
-    restaurant_name = extracted.get("restaurant_name")
-    menu_item       = extracted.get("menu_item")
-    cuisine         = extracted.get("cuisine")
-
+    order_params = state.get("order_params") or {}
     retriever = get_retriever()
-    chunks = await retriever.search(
-        query,
-        restaurant_name=restaurant_name,
-        menu_item=menu_item,
-        cuisine=cuisine,
-    )
+
+    # ── Resolve names ─────────────────────────────────────────────────────────
+    if order_params.get("restaurant_name") or order_params.get("items"):
+        restaurant_name = order_params.get("restaurant_name")
+        items = order_params.get("items") or []
+        menu_item = items[0]["name"] if items else None
+        cuisine = None
+        log.info("retrieve_using_order_params", extra={
+            "restaurant": restaurant_name,
+            "menu_item": menu_item,
+        })
+    else:
+        extracted = await _extract_query_fields(query)
+        restaurant_name = extracted.get("restaurant_name")
+        menu_item       = extracted.get("menu_item")
+        cuisine         = extracted.get("cuisine")
+        log.info("retrieve_using_extracted_fields", extra={
+            "extracted": extracted,
+            "query": query[:80],
+        })
+
+    # ── Restaurant named — confirm it exists, then find item ─────────────────
+    if restaurant_name:
+        # Step 1: confirm restaurant exists (name-only search returns menu sample)
+        restaurant_check = await retriever.search(
+            restaurant_name,
+            restaurant_name=restaurant_name,
+            menu_item=None,
+            cuisine=None,
+            top_k=1,
+        )
+
+        if not restaurant_check:
+            msg = (
+                f"Sorry, I couldn't find a restaurant called '{restaurant_name}' "
+                f"on EasyCater. Would you like to search for something else?"
+            )
+            log.info("restaurant_not_found", extra={"restaurant_name": restaurant_name})
+            return {"rag_context": "", "final_text": msg, "restaurant_not_found": True}
+
+        matched_restaurant_id   = restaurant_check[0].restaurant_id
+        matched_restaurant_name = restaurant_check[0].restaurant_name
+        log.info("restaurant_confirmed", extra={
+            "input": restaurant_name,
+            "matched": matched_restaurant_name,
+            "id": matched_restaurant_id,
+        })
+
+        if not menu_item:
+            # No item requested — return menu sample as RAG context
+            chunks = restaurant_check
+        else:
+            # Step 2: find the item within the confirmed restaurant
+            chunks = await retriever.search(
+                menu_item,
+                restaurant_name=matched_restaurant_name,
+                menu_item=menu_item,
+                cuisine=cuisine,
+                restaurant_id=matched_restaurant_id,
+            )
+
+            if not chunks:
+                # Restaurant exists but item not on menu — fetch a sample to suggest
+                sample = await retriever.search(
+                    restaurant_name,
+                    restaurant_name=matched_restaurant_name,
+                    menu_item=None,
+                    cuisine=None,
+                    top_k=3,
+                    restaurant_id=matched_restaurant_id,
+                )
+                suggestion_str = ", ".join(
+                    f"{c.item_name} (\u20b9{c.price:.0f})" for c in sample
+                ) if sample else "other items"
+                msg = (
+                    f"Sorry, '{menu_item}' isn't available at {matched_restaurant_name}. "
+                    f"They have: {suggestion_str}. "
+                    f"Would you like one of these, or should I search for "
+                    f"'{menu_item}' at another restaurant?"
+                )
+                log.info("item_not_found_at_restaurant", extra={
+                    "restaurant": matched_restaurant_name,
+                    "restaurant_id": matched_restaurant_id,
+                    "menu_item": menu_item,
+                })
+                return {"rag_context": "", "final_text": msg, "restaurant_not_found": False}
+
+    # ── Item known, no restaurant — find which restaurants serve it ───────────
+    elif menu_item:
+        chunks = await retriever.search(
+            query,
+            menu_item=menu_item,
+            cuisine=cuisine,
+            top_k=10,
+        )
+
+        if not chunks:
+            msg = (
+                f"Sorry, I couldn't find '{menu_item}' at any restaurant on EasyCater. "
+                f"Would you like to try a different dish or browse what's available?"
+            )
+            log.info("item_not_found_anywhere", extra={"menu_item": menu_item})
+            return {"rag_context": "", "final_text": msg, "restaurant_not_found": False}
+
+        # Deduplicate by restaurant — keep one entry per restaurant
+        seen: set[str] = set()
+        unique_restaurants: list[dict] = []
+        for chunk in chunks:
+            if chunk.restaurant_id not in seen:
+                seen.add(chunk.restaurant_id)
+                unique_restaurants.append({
+                    "name": chunk.restaurant_name,
+                    "id": chunk.restaurant_id,
+                    "price": chunk.price,
+                    "rating": chunk.rating,
+                })
+
+        lines = [f"Here are the restaurants serving '{menu_item}' on EasyCater:\n"]
+        for i, r in enumerate(unique_restaurants, 1):
+            rating_str = f" \u2b50{r['rating']:.1f}" if r["rating"] else ""
+            price_str  = f" \u00b7 \u20b9{r['price']:.0f}" if r["price"] else ""
+            lines.append(f"{i}. {r['name']}{rating_str}{price_str}")
+        lines.append("\nWhich restaurant would you like to order from?")
+
+        msg = "\n".join(lines)
+        log.info("restaurant_choice_presented", extra={
+            "menu_item": menu_item,
+            "n_restaurants": len(unique_restaurants),
+        })
+        return {"rag_context": "", "final_text": msg, "restaurant_not_found": False}
+
+    # ── Pure discovery — no restaurant or item named ──────────────────────────
+    else:
+        chunks = await retriever.search(query, cuisine=cuisine)
+
+    if matched_restaurant_id and not chunks:
+        item_label = f"'{menu_item}'" if menu_item else "that item"
+        msg = (
+            f"Sorry, {item_label} doesn't seem to be available at "
+            f"{matched_restaurant_name}. Would you like to see what's on their menu, "
+            f"or search for {item_label} at another restaurant?"
+        )
+        log.info("item_not_found_at_restaurant", extra={
+            "restaurant_id": matched_restaurant_id,
+            "menu_item": menu_item,
+        })
+        return {
+            "rag_context": "",
+            "final_text": msg,
+            "restaurant_not_found": False,
+        }
 
     ctx = format_chunks_for_prompt(chunks)
-    log.info("rag_retrieved", extra={
-        "n_chunks": len(chunks),
-        "query": query[:80],
-        "extracted": extracted,
-    })
-    return {"rag_context": ctx}
+    log.info("rag_retrieved", extra={"n_chunks": len(chunks), "query": query[:80]})
+    return {
+        "rag_context": ctx,
+        "restaurant_not_found": False,
+    }
 
 
 async def llm_node(state: GraphState) -> dict[str, Any]:
-    """Call vLLM with current messages + tools."""
+    """Call vLLM with current messages + tools.
+
+    RAG context is injected into a LOCAL copy of messages for this call only.
+    It is never written back to state["messages"], so it won't appear in
+    subsequent turns or Valkey history.
+    """
     messages = list(state["messages"])
 
-    # Inject RAG context as ephemeral system note before the last user message
+    # Inject RAG context as a user-role message immediately before the last
+    # user turn. User-role injections mid-conversation are followed more
+    # reliably by Qwen than system-role injections at the same position.
+    # Operates on the local copy — state["messages"] is never mutated here.
     rag_ctx = state.get("rag_context", "")
     if rag_ctx:
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user":
-                messages.insert(i, {"role": "system", "content": rag_ctx})
+                messages.insert(i, {"role": "user", "content": f"[CONTEXT]\n{rag_ctx}\n[/CONTEXT]"})
                 break
 
     resp = await chat_complete(messages, tools=TOOL_SCHEMAS, tool_choice="auto", stream=False)
@@ -214,7 +379,6 @@ async def tools_node(state: GraphState) -> dict[str, Any]:
     for tc in tool_calls:
         name = tc["function"]["name"]
 
-        # Parse LLM-provided arguments
         raw_args = tc["function"]["arguments"]
         if isinstance(raw_args, str):
             try:
@@ -248,30 +412,36 @@ async def tools_node(state: GraphState) -> dict[str, Any]:
 # ────────────────────────────────────────────────────────────────────────────
 
 def route_intent(state: GraphState) -> str:
-    """After intent_node: route to collect_params, retrieve, or retrieve directly."""
+    """After intent_node: route to collect_params or retrieve."""
     intent = state.get("intent", "general")
     if intent == "order_food":
         return "collect_params"
-    # check_order_status and general both go straight to retrieve
+    # check_order_status and general go straight to retrieve
     return "retrieve"
 
 
 def route_after_collect_params(state: GraphState) -> str:
-    """After collect_params_node: go to semantic_match or end turn."""
+    """After collect_params_node: go to retrieve (complete) or end turn (incomplete)."""
     if state.get("params_complete"):
-        return "semantic_match"
-    # Params incomplete — final_text already set with clarifying question
+        return "retrieve"
+    # Params incomplete — final_text already set with clarifying question.
+    # run_turn() will persist it to Valkey history after ainvoke() returns.
     return END
 
 
-def route_after_semantic_match(state: GraphState) -> str:
-    """After semantic_match_node: always go to retrieve for RAG context."""
-    return "retrieve"
-
-
 def route_after_retrieve(state: GraphState) -> str:
-    """After retrieve_node: always go to llm."""
+    """After retrieve_node: go to llm or short-circuit to END.
+
+    retrieve_node sets final_text + restaurant_not_found=True when the named
+    restaurant isn't in the catalogue, or sets final_text alone when the item
+    isn't available. Both cases skip the LLM entirely.
+    """
+    if state.get("restaurant_not_found") or (
+        state.get("final_text") and not state.get("rag_context")
+    ):
+        return END
     return "llm"
+
 
 
 def should_continue(state: GraphState) -> str:
@@ -299,48 +469,48 @@ def build_graph():
     # Register nodes
     g.add_node("intent", intent_node)
     g.add_node("collect_params", collect_params_node)
-    g.add_node("semantic_match", semantic_match_node)
     g.add_node("retrieve", retrieve_node)
     g.add_node("llm", llm_node)
     g.add_node("tools", tools_node)
 
     # Entry point
-    g.set_entry_point("llm")
+    g.set_entry_point("intent")
 
-    # Intent routing
+    # Intent → collect_params (order_food) or retrieve (everything else)
     g.add_conditional_edges(
-       "intent",
-       route_intent,
-       {
-           "collect_params": "collect_params",
-           "retrieve": "retrieve",
-       },
+        "intent",
+        route_intent,
+        {
+            "collect_params": "collect_params",
+            "retrieve": "retrieve",
+        },
     )
 
-    # Param collection routing
+    # collect_params → retrieve (complete) or END (needs more info)
     g.add_conditional_edges(
-       "collect_params",
-       route_after_collect_params,
-       {
-          "semantic_match": "semantic_match",
-           END: END,
-       },
+        "collect_params",
+        route_after_collect_params,
+        {
+            "retrieve": "retrieve",
+            END: END,
+        },
     )
 
-    # Semantic match always goes to retrieve
-    g.add_edge("semantic_match", "retrieve")
+    # retrieve → llm, or END if restaurant/item not found
+    g.add_conditional_edges(
+        "retrieve",
+        route_after_retrieve,
+        {"llm": "llm", END: END},
+    )
 
-    # Retrieve always goes to llm
-    g.add_edge("retrieve", "llm")
-
-    # LLM routing — tool loop or end
+    # llm → tools loop or end
     g.add_conditional_edges(
         "llm",
         should_continue,
         {"tools": "tools", END: END},
     )
 
-    # Tools always loop back to llm
+    # tools always loop back to llm
     g.add_edge("tools", "llm")
 
     return g.compile()
@@ -390,6 +560,16 @@ async def run_turn(
 
     Returns:
         (final_assistant_text, updated_history, updated_order_params)
+
+    History write rules
+    ───────────────────
+    • Normal LLM turns: all assistant + tool messages from state["messages"]
+      are appended to history (system messages stripped).
+    • collect_params incomplete turns: the LLM never ran, so state["messages"]
+      has no new assistant message. We manually append the clarifying question
+      so the user's next reply has context.
+    • RAG system injections: never written to state["messages"], so they never
+      appear in history.
     """
     graph = get_graph()
     initial_messages = build_initial_messages(history, user_message)
@@ -402,8 +582,7 @@ async def run_turn(
             "tool_iterations": 0,
             "order_params": order_params or {},
             "params_complete": False,
-            "semantic_matches": [],
-            "jwt_token":       jwt_token,
+            "jwt_token": jwt_token,
         }
     )
 
@@ -411,17 +590,38 @@ async def run_turn(
     if not final_text:
         final_text = "Sorry, I had trouble completing that. Could you rephrase?"
 
-    # Rebuild history — exclude system prompts and ephemeral RAG/semantic injections
+    # ── Rebuild Valkey history ────────────────────────────────────────────────
+    # Strip system prompts. Everything else — user, assistant, tool — is kept.
     new_messages: list[dict[str, Any]] = []
     for m in final_state["messages"]:
-        role = m.get("role")
-        if role == "system":
+        if m.get("role") == "system":
             continue
         new_messages.append(m)
 
-    # Return updated order_params — reset if order was placed
+    # If the turn ended at collect_params (params incomplete, LLM never ran),
+    # state["messages"] has no new assistant message. Append the clarifying
+    # question manually so the user's next reply lands in the right context.
+    intent = final_state.get("intent", "general")
+    params_complete_flag = final_state.get("params_complete", False)
+    tool_ran = any(m.get("role") == "tool" for m in new_messages)
+    retrieve_short_circuited = bool(
+        final_state.get("restaurant_not_found")
+        or (final_state.get("final_text") and not final_state.get("rag_context")
+            and not tool_ran and intent == "order_food" and params_complete_flag)
+    )
+
+    # If the turn ended at collect_params (params incomplete, LLM never ran),
+    # append the clarifying question so the user's next reply has context.
+    if intent == "order_food" and not params_complete_flag and not tool_ran and final_text:
+        new_messages.append({"role": "assistant", "content": final_text})
+
+    # If the turn ended at retrieve (restaurant/item not found, LLM never ran),
+    # append the not-found message so history stays coherent.
+    elif retrieve_short_circuited and final_text:
+        new_messages.append({"role": "assistant", "content": final_text})
+
+    # ── Reset order_params if order was successfully placed ───────────────────
     updated_order_params = final_state.get("order_params") or {}
-    # Clear params if order was successfully placed (place_order tool was called)
     for m in new_messages:
         if m.get("role") == "tool" and m.get("name") == "place_order":
             try:

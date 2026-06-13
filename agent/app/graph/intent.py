@@ -76,6 +76,9 @@ async def intent_node(state: dict[str, Any]) -> dict[str, Any]:
     reuse it unless the user explicitly signals a switch.
     This prevents mid-order messages like "yes", "2 please",
     "14 Alkapuri" from being misclassified as 'general'.
+
+    NOTE: This node never writes to state["messages"]. Intent classification
+    is internal routing only and must not appear in LLM conversation history.
     """
     user_message = state["user_message"]
     order_params: OrderParams = state.get("order_params") or {}
@@ -164,7 +167,12 @@ Do not invent values. Only extract what the user explicitly said.
 
 
 async def _extract_params(user_message: str, history: list[dict]) -> dict[str, Any]:
-    """Use LLM to extract order params from current message + recent history."""
+    """Use LLM to extract order params from current message + recent history.
+
+    history should contain only clean user/assistant turns (no system prompts,
+    no tool messages, no tool_calls) — filtered by collect_params_node before
+    passing in.
+    """
     recent = history[-8:] if len(history) > 8 else history
     messages = [
         {"role": "system", "content": _EXTRACT_SYSTEM},
@@ -190,14 +198,31 @@ async def _extract_params(user_message: str, history: list[dict]) -> dict[str, A
 
 
 async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
-    """Extract and accumulate order parameters."""
+    """Extract and accumulate order parameters.
+
+    NOTE: This node never writes to state["messages"].
+    - When params are complete   → returns params_complete=True, no message written.
+    - When params are incomplete → sets final_text only; the clarifying question
+      is written to Valkey history by run_turn() after graph.ainvoke() returns,
+      NOT here. This ensures the LLM never sees an incomplete-params turn in its
+      tool-calling context window.
+    """
     user_message = state["user_message"]
     history = state.get("messages", [])
 
+    # Only pass clean user/assistant turns to the extractor.
+    # Excludes: system prompts, tool results, assistant messages with tool_calls.
     clean_history = [
         m for m in history
         if m.get("role") in ("user", "assistant") and not m.get("tool_calls")
     ]
+
+        # The current user_message is already in clean_history (added by
+    # build_initial_messages). Strip it from the tail before passing to
+    # _extract_params, which appends it explicitly.
+    if clean_history and clean_history[-1].get("content") == user_message:
+        clean_history = clean_history[:-1]
+
 
     extracted = await _extract_params(user_message, clean_history)
 
@@ -216,6 +241,7 @@ async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
         return {
             "order_params": merged,
             "params_complete": True,
+            # No messages written — graph continues to semantic_match → llm
         }
     else:
         ask_text = missing_fields_message(merged)
@@ -224,5 +250,7 @@ async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
             "order_params": merged,
             "params_complete": False,
             "final_text": ask_text,
-            "messages": [{"role": "assistant", "content": ask_text}],
+            # No messages written — run_turn() appends this to Valkey history
+            # after ainvoke() so the user's next reply has context, but the
+            # LLM never sees this clarifying question in its tool-call window.
         }
