@@ -45,11 +45,8 @@ state["messages"] contains ONLY:
 
 It NEVER contains:
   • intent classifier output
-  • collect_params clarifying questions   ← these go to final_text only;
-                                            run_turn() writes them to Valkey
-                                            history after ainvoke() returns
-  • ephemeral RAG system injections       ← injected into a local copy inside
-                                            llm_node, never appended to state
+  • collect_params clarifying questions   ← these go to final_text only
+  • ephemeral RAG context injections      ← local copy in llm_node only
 """
 from __future__ import annotations
 
@@ -92,11 +89,14 @@ class GraphState(TypedDict, total=False):
     jwt_token: str
 
     # Intent routing
-    intent: str                          # "order_food" | "check_order_status" | "general"
+    intent: str                  # "order_food" | "check_order_status" | "cancel_order" | "general"
 
     # Order parameter accumulation (persisted across turns via Valkey)
-    order_params: dict[str, Any]         # {restaurant_name, items: [{name, quantity}]}
+    order_params: dict[str, Any]
     params_complete: bool
+
+    # Set True when all order details confirmed — forces place_order tool call
+    order_ready: bool
 
     # Loop guard + output
     tool_iterations: int
@@ -239,7 +239,7 @@ async def retrieve_node(state: GraphState) -> dict[str, Any]:
                     restaurant_id=matched_restaurant_id,
                 )
                 suggestion_str = ", ".join(
-                    f"{c.item_name} (\u20b9{c.price:.0f})" for c in sample
+                    f"{c.item_name} (₹{c.price:.0f})" for c in sample
                 ) if sample else "other items"
                 msg = (
                     f"Sorry, '{menu_item}' isn't available at {matched_restaurant_name}. "
@@ -286,8 +286,8 @@ async def retrieve_node(state: GraphState) -> dict[str, Any]:
 
         lines = [f"Here are the restaurants serving '{menu_item}' on EasyCater:\n"]
         for i, r in enumerate(unique_restaurants, 1):
-            rating_str = f" \u2b50{r['rating']:.1f}" if r["rating"] else ""
-            price_str  = f" \u00b7 \u20b9{r['price']:.0f}" if r["price"] else ""
+            rating_str = f" ⭐{r['rating']:.1f}" if r["rating"] else ""
+            price_str  = f" · ₹{r['price']:.0f}" if r["price"] else ""
             lines.append(f"{i}. {r['name']}{rating_str}{price_str}")
         lines.append("\nWhich restaurant would you like to order from?")
 
@@ -330,9 +330,12 @@ async def retrieve_node(state: GraphState) -> dict[str, Any]:
 async def llm_node(state: GraphState) -> dict[str, Any]:
     """Call vLLM with current messages + tools.
 
-    RAG context is injected into a LOCAL copy of messages for this call only.
-    It is never written back to state["messages"], so it won't appear in
-    subsequent turns or Valkey history.
+    RAG context is injected into a LOCAL copy of messages for this call only —
+    never written back to state["messages"].
+
+    When all order details are confirmed (restaurant, items, order_type, is_cod,
+    delivery_address for delivery orders), tool_choice is forced to place_order
+    so the model cannot respond conversationally instead of placing the order.
     """
     messages = list(state["messages"])
 
@@ -347,7 +350,46 @@ async def llm_node(state: GraphState) -> dict[str, Any]:
                 messages.insert(i, {"role": "user", "content": f"[CONTEXT]\n{rag_ctx}\n[/CONTEXT]"})
                 break
 
-    resp = await chat_complete(messages, tools=TOOL_SCHEMAS, tool_choice="auto", stream=False)
+    # ── Detect if all order details are confirmed → force place_order ─────────
+    order_params = state.get("order_params") or {}
+    order_type   = order_params.get("order_type")
+    is_cod       = order_params.get("is_cod")
+    has_address  = order_params.get("delivery_address") is not None
+
+    all_confirmed = (
+        bool(order_params.get("restaurant_name"))
+        and bool(order_params.get("items"))
+        and order_type in ("delivery", "pickup", "dinein")
+        and is_cod is not None
+        and (order_type != "delivery" or has_address)
+    )
+
+    if all_confirmed:
+        tool_choice: str | dict = {
+            "type": "function",
+            "function": {"name": "place_order"},
+        }
+        log.info("llm_forcing_place_order", extra={
+            "restaurant":  order_params.get("restaurant_name"),
+            "order_type":  order_type,
+            "is_cod":      is_cod,
+            "has_address": has_address,
+        })
+    else:
+        tool_choice = "auto"
+        log.info("llm_auto_mode", extra={
+            "restaurant":  order_params.get("restaurant_name"),
+            "order_type":  order_type,
+            "is_cod":      is_cod,
+            "has_address": has_address,
+        })
+
+    resp = await chat_complete(
+        messages,
+        tools=TOOL_SCHEMAS,
+        tool_choice=tool_choice,
+        stream=False,
+    )
     choice = resp.choices[0]
     msg = choice.message
 
@@ -368,6 +410,7 @@ async def llm_node(state: GraphState) -> dict[str, Any]:
             "has_tool_calls": bool(msg.tool_calls),
             "n_tool_calls": len(msg.tool_calls or []),
             "content_len": len(msg.content or ""),
+            "forced": all_confirmed,
         },
     )
 
@@ -383,7 +426,16 @@ async def tools_node(state: GraphState) -> dict[str, Any]:
     tool_calls = last_msg.get("tool_calls", [])
     jwt_token = state.get("jwt_token", "")
 
+    # JWT presence check — confirms token flows end-to-end
+    log.info("tools_node_jwt_check", extra={
+        "jwt_present": bool(jwt_token),
+        "jwt_prefix":  jwt_token[:20] if jwt_token else "EMPTY",
+        "n_tool_calls": len(tool_calls),
+    })
+
     tool_messages: list[dict[str, Any]] = []
+    updated_order_params = dict(state.get("order_params") or {})
+
     for tc in tool_calls:
         name = tc["function"]["name"]
 
@@ -402,17 +454,40 @@ async def tools_node(state: GraphState) -> dict[str, Any]:
 
         log.info("tool_invoke", extra={"tool": name, "tool_call_id": tc["id"]})
         result = await execute_tool(name, args)
-        tool_messages.append(
-            {
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "name": name,
-                "content": result,
-            }
-        )
+
+        # When LLM calls place_order, capture delivery_address it used
+        # so order_params stays in sync for the forced-tool-call detection
+        if name == "place_order":
+            try:
+                place_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                if place_args.get("delivery_address"):
+                    updated_order_params["delivery_address"] = place_args["delivery_address"]
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+        if name == "get_user_addresses":
+            try:
+                addr_result = json.loads(result)
+                log.info("addresses_fetched", extra={
+                    "success": addr_result.get("success"),
+                    "count":   addr_result.get("total", 0),
+                })
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+        tool_messages.append({
+            "role":         "tool",
+            "tool_call_id": tc["id"],
+            "name":         name,
+            "content":      result,
+        })
 
     iters = state.get("tool_iterations", 0) + 1
-    return {"messages": tool_messages, "tool_iterations": iters}
+    return {
+        "messages":        tool_messages,
+        "tool_iterations": iters,
+        "order_params":    updated_order_params,
+    }
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -471,6 +546,7 @@ def should_continue(state: GraphState) -> str:
 # ────────────────────────────────────────────────────────────────────────────
 
 def build_graph():
+    log.info("graph_building", extra={"entry": "intent", "nodes": "full_pipeline"})
     g = StateGraph(GraphState)
 
     # Register nodes
@@ -613,12 +689,16 @@ async def run_turn(
     tool_ran = any(m.get("role") == "tool" for m in new_messages)
     retrieve_short_circuited = bool(
         final_state.get("restaurant_not_found")
-        or (final_state.get("final_text") and not final_state.get("rag_context")
-            and not tool_ran and intent == "order_food" and params_complete_flag)
+        or (
+            final_state.get("final_text")
+            and not final_state.get("rag_context")
+            and not tool_ran
+            and intent == "order_food"
+            and params_complete_flag
+        )
     )
 
-    # If the turn ended at collect_params (params incomplete, LLM never ran),
-    # append the clarifying question so the user's next reply has context.
+    # Append clarifying question when collect_params ended the turn
     if intent == "order_food" and not params_complete_flag and not tool_ran and final_text:
         new_messages.append({"role": "assistant", "content": final_text})
 

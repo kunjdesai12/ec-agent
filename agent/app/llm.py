@@ -35,7 +35,7 @@ async def chat_complete(
     messages: list[dict[str, Any]],
     *,
     tools: Optional[list[dict[str, Any]]] = None,
-    tool_choice: str = "auto",
+    tool_choice: str | dict = "auto",
     stream: bool = False,
 ) -> Any:
     """Non-streaming or streaming chat completion.

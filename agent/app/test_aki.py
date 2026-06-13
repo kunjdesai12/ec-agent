@@ -341,6 +341,7 @@ def interactive(session_id, jwt_token=""):
     print(f"  Session : {c(CY, session_id)}")
     print(f"  Commands: {c(DM, ', '.join(COMMANDS.keys()))}")
     print(c(B, '═' * 58) + "\n")
+    print(c(DM, f"  JWT token (first 30 chars): {jwt_token[:30]}"))
 
     while True:
         try:
