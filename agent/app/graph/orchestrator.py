@@ -160,6 +160,14 @@ async def retrieve_node(state: GraphState) -> dict[str, Any]:
     order_params = state.get("order_params") or {}
     retriever = get_retriever()
 
+    # Initialize so pure-discovery path never hits NameError
+    matched_restaurant_id   = None
+    matched_restaurant_name = None
+    chunks = []
+    cuisine = None
+    menu_item = None
+    restaurant_name = None
+
     # ── Resolve names ─────────────────────────────────────────────────────────
     if order_params.get("restaurant_name") or order_params.get("items"):
         restaurant_name = order_params.get("restaurant_name")
@@ -412,11 +420,10 @@ async def tools_node(state: GraphState) -> dict[str, Any]:
 # ────────────────────────────────────────────────────────────────────────────
 
 def route_intent(state: GraphState) -> str:
-    """After intent_node: route to collect_params or retrieve."""
     intent = state.get("intent", "general")
     if intent == "order_food":
         return "collect_params"
-    # check_order_status and general go straight to retrieve
+    # cancel_order, check_order_status, general all go to retrieve
     return "retrieve"
 
 

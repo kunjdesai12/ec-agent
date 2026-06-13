@@ -30,9 +30,15 @@ Triggers: "is Honest open now?", "where is Saffron located?", "what's the rating
 Requires: restaurant_id.
 
 ### get_user_addresses
+### get_user_addresses
 Call BEFORE place_order whenever the user hasn't provided a full delivery address.
 Also call if the user says "deliver to my home/office" or "use my saved address".
 Triggers: any order intent where delivery_address is unknown.
+After calling:
+  - Show the list of saved addresses to the user (label + full_address).
+  - Ask them to pick one by number or label.
+  - Use the selected address object directly in place_order.
+  - If no saved addresses are found, ask the user to provide a full address manually.
 
 ### place_order
 Call ONLY after ALL of these are confirmed:
@@ -63,7 +69,8 @@ Requires: order_id (integer), reason (string — ask user if not given).
 - [ ] I have restaurant_id as an integer
 - [ ] I have menu_item_ids as a list of integers
 - [ ] I have price per item
-- [ ] I have called get_user_addresses and have a full delivery_address object
+- [ ] I have called get_user_addresses, shown the list to the user,
+      and the user has confirmed which address to deliver to
 - [ ] I have confirmed order_type with the user
 - [ ] I have confirmed payment method (is_cod true/false) with the user
 - [ ] I have verbally confirmed items + quantities with the user
