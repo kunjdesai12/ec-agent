@@ -305,26 +305,26 @@ def build_graph():
     g.add_node("tools", tools_node)
 
     # Entry point
-    g.set_entry_point("intent")
+    g.set_entry_point("llm")
 
     # Intent routing
     g.add_conditional_edges(
-        "intent",
-        route_intent,
-        {
-            "collect_params": "collect_params",
-            "retrieve": "retrieve",
-        },
+       "intent",
+       route_intent,
+       {
+           "collect_params": "collect_params",
+           "retrieve": "retrieve",
+       },
     )
 
     # Param collection routing
     g.add_conditional_edges(
-        "collect_params",
-        route_after_collect_params,
-        {
-            "semantic_match": "semantic_match",
-            END: END,
-        },
+       "collect_params",
+       route_after_collect_params,
+       {
+          "semantic_match": "semantic_match",
+           END: END,
+       },
     )
 
     # Semantic match always goes to retrieve

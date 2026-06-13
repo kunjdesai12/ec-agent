@@ -1,19 +1,23 @@
 """EasyCater LLM API — FastAPI entrypoint.
 
 Endpoints:
+  POST /v1/auth/send-otp            — send OTP to user's phone (login)
+  POST /v1/auth/verify-otp          — verify OTP and get JWT token
   POST /v1/chat                     — SSE streaming chat
   POST /v1/chat/sync                — non-streaming variant (debug/tests)
+  POST /v1/chat/voice               — voice chat (STT → chat pipeline)
   GET  /v1/health                   — liveness + Redis ping
   POST /v1/session/{sid}/reset      — clear conversation history
 """
 from __future__ import annotations
-
+import os
 import asyncio
 import json
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+import httpx
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
@@ -32,6 +36,9 @@ log = get_logger(__name__)
 
 guardrails = AkiGuardrails()
 
+STT_API_ENDPOINT = get_settings().stt_api_endpoint
+
+ml_models = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: ARG001
@@ -62,21 +69,145 @@ app.add_middleware(
 # Schemas
 # ────────────────────────────────────────────────────────────────────────────
 
+ 
+class SendOTPRequest(BaseModel):
+    phone: str = Field(..., min_length=7, max_length=15)
+    country_code: str = Field("+91")
+ 
+class VerifyOTPRequest(BaseModel):
+    phone: str = Field(..., min_length=7, max_length=15)
+    otp: str = Field(..., min_length=4, max_length=8)
+    country_code: str = Field("+91")
+
 class ChatRequest(BaseModel):
     session_id: str = Field(..., min_length=1, max_length=128)
     message: str = Field(..., min_length=1, max_length=4000)
     user_id: Optional[str] = None
     jwt_token: Optional[str] = None
 
-
 class ChatSyncResponse(BaseModel):
     session_id: str
     text: str
 
+class VoiceJobResponse(BaseModel):
+    session_id: str
+    job_id: str
+
+class VoiceJobResultRequest(BaseModel):
+    session_id: str
+    job_id: str
+
+
+def clear_console():
+    os.system("cls" if os.name == "nt" else "clear")
 
 # ────────────────────────────────────────────────────────────────────────────
 # Endpoints
 # ────────────────────────────────────────────────────────────────────────────
+
+@app.post("/auth/send-otp")
+async def send_otp(req: SendOTPRequest):
+    """Send OTP to user's phone number.
+ 
+    Forwards to the production backend. The caller only needs to provide
+    phone and country_code — all other fields are hardcoded for the
+    customer login flow.
+    """
+    payload = {
+        "country_code":          req.country_code,
+        "phone":                 req.phone,
+        "type":                  "login",
+        "user_type":             "user",
+        "validate_company_user": "false",
+        "formType":              "loginForm",
+    }
+ 
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                f"{get_settings().backend_base_url}/restaurants/send-otp-with-mobile",
+                json=payload,
+            )
+
+            print("STATUS:", response.status_code)
+            print("BODY:")
+            print(response.text)
+
+            try:
+                data = response.json()
+            except Exception:
+                log.error("send_otp_bad_response", extra={
+                    "status": response.status_code,
+                    "body": response.text[:200],
+                })
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Auth service returned non-JSON response (status {response.status_code})"
+                )
+            
+    except httpx.HTTPError as e:
+        log.error("send_otp_failed", extra={"err": str(e)})
+        raise HTTPException(status_code=502, detail="Could not reach auth service")
+ 
+    if response.status_code not in (200, 201):
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=data.get("message", "Failed to send OTP"),
+        )
+ 
+    return {"ok": True, "message": data.get("message", "OTP sent successfully")}
+ 
+ 
+@app.post("/auth/verify-otp")
+async def verify_otp(req: VerifyOTPRequest):
+    """Verify OTP and return JWT token.
+ 
+    On success returns { ok, token, user_id, name } — the caller should
+    pass token as jwt_token in all subsequent /v1/chat requests.
+    """
+    payload = {
+        "country_code": req.country_code,
+        "phone":        req.phone,
+        "otp":          req.otp,
+        "otp_type":     "login",
+        "role_name":    "customer",
+        "is_corporate": 0,
+    }
+ 
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                f"{get_settings().backend_base_url}/login/user-mobile",
+                json=payload,
+            )
+            data = response.json()
+    except httpx.HTTPError as e:
+        log.error("verify_otp_failed", extra={"err": str(e)})
+        raise HTTPException(status_code=502, detail="Could not reach auth service")
+ 
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=data.get("message", "OTP verification failed"),
+        )
+ 
+    token_data = data.get("data", {})
+    token      = token_data.get("token")
+    user       = token_data.get("users", {})
+ 
+    if not token:
+        log.error("verify_otp_no_token", extra={"phone": req.phone})
+        raise HTTPException(status_code=502, detail="Auth service returned no token")
+ 
+    log.info("user_logged_in", extra={"user_id": user.get("user_id"), "phone": req.phone})
+ 
+    return {
+        "ok":      True,
+        "token":   token,
+        "user_id": user.get("user_id"),
+        "name":    user.get("name"),
+    }
+
 
 @app.get("/v1/health")
 async def health():
@@ -98,7 +229,7 @@ async def health():
 @app.post("/v1/chat/sync", response_model=ChatSyncResponse)
 async def chat_sync(req: ChatRequest):
     """Non-streaming chat — useful for tests and server-to-server calls."""
-
+    clear_console()
     # ── Guardrail input check ──────────────────────────────────
     guard = await guardrails.check_input(req.message, req.session_id)
     if guard["blocked"]:
@@ -113,7 +244,7 @@ async def chat_sync(req: ChatRequest):
     order_params = await load_order_params(req.session_id)
 
     text, new_history, updated_order_params = await run_turn(
-        req.session_id, req.message, history, order_params
+        req.session_id, req.message, history, order_params, jwt_token=req.jwt_token or "",
     )
 
     await save_history(
@@ -150,7 +281,7 @@ async def chat_stream(req: ChatRequest):
         updated_params: dict = order_params
         try:
             async for event in stream_turn(
-                req.session_id, req.message, history, order_params
+                req.session_id, req.message, history, order_params, jwt_token=req.jwt_token or "",
             ):
                 if event["type"] == "done":
                     persistable = event["messages"]
@@ -170,6 +301,67 @@ async def chat_stream(req: ChatRequest):
             raise
 
     return EventSourceResponse(event_gen())
+
+
+@app.post("/v1/chat/voice", response_model=ChatSyncResponse)
+async def chat_voice(
+    session_id: str           = Form(...),
+    audio:      UploadFile    = File(...),
+    jwt_token:  Optional[str] = Form(None),
+):
+    """Voice chat — transcribes audio via STT, then runs the normal chat pipeline."""
+    audio_bytes = await audio.read()
+ 
+    async with httpx.AsyncClient() as client:
+        stt_response = await client.post(
+            STT_API_ENDPOINT,
+            files={"file": (audio.filename, audio_bytes, audio.content_type)},
+            timeout=100.0,
+        )
+        stt_response.raise_for_status()
+ 
+    stt_data         = stt_response.json()
+    result           = stt_data.get("result", {})
+    transcribed_text = result.get("translated_text") or result.get("text")
+ 
+    if not transcribed_text:
+        log.warning(
+            "stt_empty_transcript",
+            extra={"session_id": session_id, "job_id": stt_data.get("job_id")},
+        )
+        return ChatSyncResponse(
+            session_id=session_id,
+            text="Sorry, I couldn't understand the audio. Please try again.",
+        )
+ 
+    guard = await guardrails.check_input(transcribed_text, session_id)
+    if guard["blocked"]:
+        log.info(
+            "guardrail_blocked",
+            extra={"session_id": session_id, "violation": guard["violation"]},
+        )
+        return ChatSyncResponse(session_id=session_id, text=guard["response"])
+ 
+    history      = await load_history(session_id)
+    order_params = await load_order_params(session_id)
+ 
+    text, new_history, updated_order_params = await run_turn(
+        session_id,
+        transcribed_text,
+        history,
+        order_params,
+        jwt_token=jwt_token or "",
+    )
+ 
+    await save_history(
+        session_id,
+        history
+        + [{"role": "user", "content": transcribed_text}]
+        + _without_user_dup(new_history, transcribed_text),
+    )
+    await save_order_params(session_id, updated_order_params)
+ 
+    return ChatSyncResponse(session_id=session_id, text=text)
 
 
 @app.post("/v1/session/{session_id}/reset")

@@ -159,6 +159,7 @@ async def semantic_match_node(state: dict[str, Any]) -> dict[str, Any]:
             f"on EasyCater. Could you check the name or try a different restaurant?"
         )
         log.warning("semantic_match_no_restaurant", extra={"query": restaurant_name})
+        log.warning("------------------------")
         return {
             "semantic_matches": [],
             "messages": [{"role": "system", "content": msg}],
@@ -179,7 +180,7 @@ async def semantic_match_node(state: dict[str, Any]) -> dict[str, Any]:
             "similarity": round(restaurant_similarity, 3),
         },
     )
-
+    log.info("------------------------")
     # ── Step 2: Match each item within the restaurant ─────────────────────
     item_names = [item["name"] for item in items]
     item_matches = await asyncio.to_thread(
@@ -277,7 +278,7 @@ async def semantic_match_node(state: dict[str, Any]) -> dict[str, Any]:
             "items_requested": len(items),
         },
     )
-
+    log.info("------------------------")
     return {
         "semantic_matches": semantic_matches,
         "messages": [{"role": "system", "content": context}],

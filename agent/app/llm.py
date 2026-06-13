@@ -58,6 +58,7 @@ async def chat_complete(
     log.info("llm_messages", extra={
         "messages": messages,
     })
+    log.info("------------------------")
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = tool_choice
