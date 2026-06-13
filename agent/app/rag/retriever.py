@@ -32,7 +32,7 @@ _RESTAURANT_TRGM_THRESHOLD = 0.3
 _ITEM_TRGM_THRESHOLD       = 0.3
 
 # Minimum vector similarity for pure discovery queries (no name known).
-_VECTOR_SIM_THRESHOLD = 0.50
+_VECTOR_SIM_THRESHOLD = 0.35
 
 
 @dataclass

@@ -20,7 +20,7 @@ You are an intent classifier for a food ordering assistant.
 Classify the user message into exactly one of these intents:
 - order_food         : user wants to place a new food order
 - check_order_status : user wants to check status of an existing order
-- cancel_intent      : user wants to cancel or start over
+- cancel_order       : user wants to cancel an existing order
 - general            : anything else (discovery, questions, greetings, complaints)
 
 Respond with ONLY a JSON object, nothing else:
@@ -36,6 +36,10 @@ _SWITCH_SIGNALS = {
     "check_order_status": [
         "order food", "i want to order", "place order",
         "get me", "i'll have", "cancel", "start over", "never mind",
+    ],
+    "cancel_order": [
+        "order food", "i want to order", "place order",
+        "start over", "never mind", "forget it",
     ],
 }
 
@@ -114,6 +118,8 @@ async def intent_node(state: dict[str, Any]) -> dict[str, Any]:
             intent = "order_food"
         elif any(w in lower for w in ["status", "track", "where is", "my order"]):
             intent = "check_order_status"
+        elif any(w in lower for w in ["cancel", "cancellation", "stop order"]):
+            intent = "cancel_order"
         else:
             intent = "general"
 
@@ -124,12 +130,8 @@ async def intent_node(state: dict[str, Any]) -> dict[str, Any]:
 
     # ── Store active intent in order_params so it persists across turns ───────
     # Only set/update when intent is actionable (not general/cancel)
-    if intent in ("order_food", "check_order_status"):
-        order_params["active_intent"] = intent
-    elif intent == "cancel_intent":
-        # Clear sticky intent and order params on explicit cancel
-        order_params["active_intent"] = None
-        log.info("intent_reset", extra={"reason": "cancel_intent"})
+    if intent in ("order_food", "check_order_status", "cancel_order"):
+    order_params["active_intent"] = intent
 
     return {
         "intent": intent,
