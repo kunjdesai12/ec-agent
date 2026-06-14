@@ -16,7 +16,7 @@ restructure to stream directly from the graph; we can optimize later.
 """
 from __future__ import annotations
 
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Optional
 
 from agent.app.graph.orchestrator import build_initial_messages, get_graph
 from agent.app.llm import stream_text
@@ -54,6 +54,9 @@ async def stream_turn(
                 "user_message": user_message,
                 "messages": initial_messages,
                 "tool_iterations": 0,
+                "order_params": order_params or {},
+                "params_complete": False,
+                "jwt_token": jwt_token,
             }
         )
 
@@ -105,7 +108,7 @@ async def stream_turn(
             new_messages.append(m)
         new_messages.append({"role": "assistant", "content": "".join(streamed_text_parts)})
 
-        yield {"type": "done", "messages": new_messages}
+        yield {"type": "done", "messages": new_messages, "order_params": final_state.get("order_params") or {}}
 
     except Exception as e:  # noqa: BLE001
         log.exception("stream_turn_failed")

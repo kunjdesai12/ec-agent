@@ -249,8 +249,13 @@ async def chat_sync(req: ChatRequest):
 
     await save_history(
         req.session_id,
-        history + [{"role": "user", "content": req.message}] + _without_user_dup(new_history, req.message),
+        _dedup_history(
+            history
+            + [{"role": "user", "content": req.message}]
+            + _without_user_dup(new_history, req.message)
+        ),
     )
+
     await save_order_params(req.session_id, updated_order_params)
 
     return ChatSyncResponse(session_id=req.session_id, text=text)
@@ -355,10 +360,13 @@ async def chat_voice(
  
     await save_history(
         session_id,
-        history
-        + [{"role": "user", "content": transcribed_text}]
-        + _without_user_dup(new_history, transcribed_text),
+        _dedup_history(
+            history
+            + [{"role": "user", "content": transcribed_text}]
+            + _without_user_dup(new_history, transcribed_text)
+        ),
     )
+
     await save_order_params(session_id, updated_order_params)
  
     return ChatSyncResponse(session_id=session_id, text=text)
@@ -380,3 +388,35 @@ def _without_user_dup(new_msgs: list[dict], user_msg: str) -> list[dict]:
     if new_msgs and new_msgs[0].get("role") == "user" and new_msgs[0].get("content") == user_msg:
         return new_msgs[1:]
     return new_msgs
+
+def _dedup_history(messages: list[dict]) -> list[dict]:
+    """Remove duplicate message blocks from history.
+    
+    Deduplicates both simple consecutive duplicates and repeated
+    tool call + tool result pairs that accumulate across turns.
+    """
+    if not messages:
+        return messages
+
+    # Build a fingerprint for each message
+    def _fingerprint(m: dict) -> str:
+        role = m.get("role", "")
+        content = m.get("content") or ""
+        # For assistant messages with tool_calls, include the tool call id
+        tool_calls = m.get("tool_calls")
+        if tool_calls:
+            tc_sig = ",".join(tc["function"]["name"] for tc in tool_calls)
+            return f"{role}:tool_calls:{tc_sig}"
+        tool_call_id = m.get("tool_call_id", "")
+        if tool_call_id:
+            return f"{role}:tool_result:{tool_call_id}:{content[:100]}"
+        return f"{role}:{content[:200]}"
+
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for msg in messages:
+        fp = _fingerprint(msg)
+        if fp not in seen:
+            seen.add(fp)
+            deduped.append(msg)
+    return deduped

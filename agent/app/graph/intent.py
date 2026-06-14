@@ -7,7 +7,7 @@ from typing import Any
 
 from agent.app.llm import chat_complete
 from agent.app.logging_setup import get_logger
-from agent.app.state.order_state import OrderParams, merge_order_params, params_complete, missing_fields_message
+from agent.app.state.order_state import ( OrderParams, merge_order_params, params_complete, missing_fields_message, should_clear_items)
 
 log = get_logger(__name__)
 
@@ -144,27 +144,35 @@ async def intent_node(state: dict[str, Any]) -> dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _EXTRACT_SYSTEM = """\
-Extract:
-- restaurant_name : name of the restaurant (string or null)
-- items           : list of objects with:
-                      - name: string
-                      - quantity: integer (defaults to 1)
-                      - special_instructions: string or null
-                        (e.g. "extra spicy", "no onions", "less oil")
-                    Only include special_instructions if the user explicitly
-                    said something about how the item should be prepared.
+Extract order parameters from the user message.
 
 Return ONLY a JSON object, nothing else:
 {
   "restaurant_name": "<name or null>",
   "items": [
-    {"name": "<item>", "quantity": <int>, "special_instructions": "<str or null>"},
-    ...
-  ]
+    {"name": "<item>", "quantity": <int>, "special_instructions": "<str or null>"}
+  ],
+  "order_type": "<delivery|pickup|dinein or null>",
+  "is_cod": <true|false|null>
 }
 
-If a field is not mentioned, use null for restaurant_name and [] for items.
+Extraction rules:
+- restaurant_name : name of the restaurant, or null if not mentioned
+- items           : list of food/drink items the user wants to order
+                    - name: item name (string)
+                    - quantity: how many (integer, defaults to 1)
+                    - special_instructions: only if user explicitly said how
+                      to prepare it (e.g. "extra spicy", "no onions"), else null
+- order_type      : "delivery" if user wants it delivered
+                    "pickup" if user says takeaway/pickup/take away/parcel/collect
+                    "dinein" if user says dine in/eat here/sit down
+                    null if not mentioned
+- is_cod          : true if user says cash/COD/cash on delivery
+                    false if user says online/card/UPI/digital payment
+                    null if not mentioned
+
 Do not invent values. Only extract what the user explicitly said.
+If a field is not mentioned, use null for strings and null for booleans.
 """
 
 
@@ -196,24 +204,90 @@ async def _extract_params(user_message: str, history: list[dict]) -> dict[str, A
         return json.loads(raw)
     except json.JSONDecodeError:
         log.warning("param_extraction_parse_failed", extra={"raw": raw[:200]})
-        return {"restaurant_name": None, "items": []}
+        return {"restaurant_name": None, "items": [], "order_type": None, "is_cod": None}
+
+
+def _resolve_address_selection(
+    user_message: str, saved_addresses: list[dict]
+) -> dict | None:
+    import re
+    lower = user_message.lower().strip()
+
+    # Numeric selection — "1", "2", etc.
+    num_match = re.search(r'\b([1-9])\b', lower)
+    if num_match:
+        idx = int(num_match.group(1)) - 1
+        if 0 <= idx < len(saved_addresses):
+            return _format_address_for_order(saved_addresses[idx])
+
+    # Ordinal words
+    ordinals = {
+        "first": 0, "1st": 0,
+        "second": 1, "2nd": 1,
+        "third": 2, "3rd": 2,
+    }
+    for word, idx in ordinals.items():
+        if word in lower and idx < len(saved_addresses):
+            return _format_address_for_order(saved_addresses[idx])
+
+    # Label match — check if any address label appears in the user message
+    # Also handle common aliases
+    label_aliases = {
+        "office": "work",
+        "my home": "home",
+        "house": "home",
+        "at home": "home",
+        "home address": "home",
+        "work address": "work",
+    }
+    # Apply aliases first
+    normalized = lower
+    for alias, replacement in label_aliases.items():
+        if alias in normalized:
+            normalized = normalized.replace(alias, replacement)
+
+    for addr in saved_addresses:
+        label = (addr.get("label") or "").lower()
+        # Check if the label appears anywhere in the (normalized) user message
+        if label and label in normalized:
+            return _format_address_for_order(addr)
+
+    # If only one address exists and user said yes/ok/that one/confirm
+    confirm_signals = ["yes", "ok", "okay", "that one", "this one", "confirm", "sure", "yep", "yeah"]
+    if len(saved_addresses) == 1 and any(s in lower for s in confirm_signals):
+        return _format_address_for_order(saved_addresses[0])
+
+    return None
+
+
+def _format_address_for_order(addr: dict) -> dict:
+    """Convert a saved address dict into the shape place_order expects."""
+    return {
+        "address_line_1": addr.get("full_address") or addr.get("address_line_1", ""),
+        "address_line_2": addr.get("house_number") or addr.get("floor_no") or "",
+        "landmark":       addr.get("landmark") or "",
+        "city":           addr.get("city", ""),
+        "state":          addr.get("state", ""),
+        "pincode":        str(addr.get("pincode", "")),
+        "latitude":       float(addr.get("latitude") or 0),
+        "longitude":      float(addr.get("longitude") or 0),
+        # preserve label for logging
+        "label":          addr.get("label", ""),
+    }
 
 
 async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
     """Extract and accumulate order parameters.
 
+    Extracts: restaurant_name, items, order_type, is_cod from the user message.
+    order_type and is_cod are stored in order_params so llm_node can detect
+    when all details are confirmed and force the place_order tool call.
+
     NOTE: This node never writes to state["messages"].
-    - When params are complete   → returns params_complete=True, no message written.
-    - When params are incomplete → sets final_text only; the clarifying question
-      is written to Valkey history by run_turn() after graph.ainvoke() returns,
-      NOT here. This ensures the LLM never sees an incomplete-params turn in its
-      tool-calling context window.
     """
     user_message = state["user_message"]
     history = state.get("messages", [])
 
-    # Only pass clean user/assistant turns to the extractor.
-    # Excludes: system prompts, tool results, assistant messages with tool_calls.
     clean_history = [
         m for m in history
         if m.get("role") in ("user", "assistant") and not m.get("tool_calls")
@@ -225,17 +299,46 @@ async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
     if clean_history and clean_history[-1].get("content") == user_message:
         clean_history = clean_history[:-1]
 
-
     extracted = await _extract_params(user_message, clean_history)
 
     existing: OrderParams = state.get("order_params") or {}
+
+    # ── Clear stale items if user is changing their selection ─────────────────
+    if should_clear_items(user_message):
+        existing = dict(existing)
+        existing["items"] = []
+        log.info("items_cleared", extra={
+            "reason": "change_signal_detected",
+            "msg": user_message[:80],
+        })
+
     merged = merge_order_params(existing, extracted)
+
+    saved_addresses = merged.get("_saved_addresses", [])
+    if saved_addresses and not merged.get("delivery_address"):
+        resolved = _resolve_address_selection(user_message, saved_addresses)
+        if resolved:
+            merged["delivery_address"] = resolved
+            log.info("delivery_address_resolved", extra={
+                "label": resolved.get("label"),
+                "city":  resolved.get("city"),
+            })
+
+    # ── Persist order_type and is_cod from extraction into order_params ───────
+    # These are not handled by merge_order_params since they're new fields.
+    # Only overwrite if the extractor found a value (don't clear existing).
+    if extracted.get("order_type") is not None:
+        merged["order_type"] = extracted["order_type"]
+    if extracted.get("is_cod") is not None:
+        merged["is_cod"] = extracted["is_cod"]
 
     log.info(
         "params_collected",
         extra={
             "restaurant": merged.get("restaurant_name"),
             "item_count": len(merged.get("items", [])),
+            "order_type":  merged.get("order_type"),
+            "is_cod": merged.get("is_cod"),
         },
     )
 
@@ -252,7 +355,4 @@ async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
             "order_params": merged,
             "params_complete": False,
             "final_text": ask_text,
-            # No messages written — run_turn() appends this to Valkey history
-            # after ainvoke() so the user's next reply has context, but the
-            # LLM never sees this clarifying question in its tool-call window.
         }

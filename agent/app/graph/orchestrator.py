@@ -45,11 +45,8 @@ state["messages"] contains ONLY:
 
 It NEVER contains:
   • intent classifier output
-  • collect_params clarifying questions   ← these go to final_text only;
-                                            run_turn() writes them to Valkey
-                                            history after ainvoke() returns
-  • ephemeral RAG system injections       ← injected into a local copy inside
-                                            llm_node, never appended to state
+  • collect_params clarifying questions   ← these go to final_text only
+  • ephemeral RAG context injections      ← local copy in llm_node only
 """
 from __future__ import annotations
 
@@ -92,11 +89,14 @@ class GraphState(TypedDict, total=False):
     jwt_token: str
 
     # Intent routing
-    intent: str                          # "order_food" | "check_order_status" | "general"
+    intent: str                  # "order_food" | "check_order_status" | "cancel_order" | "general"
 
     # Order parameter accumulation (persisted across turns via Valkey)
-    order_params: dict[str, Any]         # {restaurant_name, items: [{name, quantity}]}
+    order_params: dict[str, Any]
     params_complete: bool
+
+    # Set True when all order details confirmed — forces place_order tool call
+    order_ready: bool
 
     # Loop guard + output
     tool_iterations: int
@@ -158,6 +158,13 @@ async def retrieve_node(state: GraphState) -> dict[str, Any]:
     """
     query = state["user_message"]
     order_params = state.get("order_params") or {}
+
+    # Skip re-retrieval if we already have RAG context from a prior turn
+    # cached_rag = order_params.get("_rag_context")
+    # if cached_rag:
+    #     log.info("retrieve_cache_hit", extra={"session_id": state.get("session_id")})
+    #     return {"rag_context": cached_rag, "restaurant_not_found": False}
+
     retriever = get_retriever()
 
     # Initialize so pure-discovery path never hits NameError
@@ -239,7 +246,7 @@ async def retrieve_node(state: GraphState) -> dict[str, Any]:
                     restaurant_id=matched_restaurant_id,
                 )
                 suggestion_str = ", ".join(
-                    f"{c.item_name} (\u20b9{c.price:.0f})" for c in sample
+                    f"{c.item_name} (₹{c.price:.0f})" for c in sample
                 ) if sample else "other items"
                 msg = (
                     f"Sorry, '{menu_item}' isn't available at {matched_restaurant_name}. "
@@ -286,8 +293,8 @@ async def retrieve_node(state: GraphState) -> dict[str, Any]:
 
         lines = [f"Here are the restaurants serving '{menu_item}' on EasyCater:\n"]
         for i, r in enumerate(unique_restaurants, 1):
-            rating_str = f" \u2b50{r['rating']:.1f}" if r["rating"] else ""
-            price_str  = f" \u00b7 \u20b9{r['price']:.0f}" if r["price"] else ""
+            rating_str = f" ⭐{r['rating']:.1f}" if r["rating"] else ""
+            price_str  = f" · ₹{r['price']:.0f}" if r["price"] else ""
             lines.append(f"{i}. {r['name']}{rating_str}{price_str}")
         lines.append("\nWhich restaurant would you like to order from?")
 
@@ -321,8 +328,14 @@ async def retrieve_node(state: GraphState) -> dict[str, Any]:
 
     ctx = format_chunks_for_prompt(chunks)
     log.info("rag_retrieved", extra={"n_chunks": len(chunks), "query": query[:80]})
+
+    # Cache RAG context in order_params so subsequent turns skip re-retrieval
+    # updated_params = dict(order_params)
+    # updated_params["_rag_context"] = ctx
+
     return {
         "rag_context": ctx,
+        # "order_params": updated_params,
         "restaurant_not_found": False,
     }
 
@@ -330,9 +343,12 @@ async def retrieve_node(state: GraphState) -> dict[str, Any]:
 async def llm_node(state: GraphState) -> dict[str, Any]:
     """Call vLLM with current messages + tools.
 
-    RAG context is injected into a LOCAL copy of messages for this call only.
-    It is never written back to state["messages"], so it won't appear in
-    subsequent turns or Valkey history.
+    RAG context is injected into a LOCAL copy of messages for this call only —
+    never written back to state["messages"].
+
+    When all order details are confirmed (restaurant, items, order_type, is_cod,
+    delivery_address for delivery orders), tool_choice is forced to place_order
+    so the model cannot respond conversationally instead of placing the order.
     """
     messages = list(state["messages"])
 
@@ -342,12 +358,77 @@ async def llm_node(state: GraphState) -> dict[str, Any]:
     # Operates on the local copy — state["messages"] is never mutated here.
     rag_ctx = state.get("rag_context", "")
     if rag_ctx:
+        insert_idx = len(messages)  # default: append at end
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user":
-                messages.insert(i, {"role": "user", "content": f"[CONTEXT]\n{rag_ctx}\n[/CONTEXT]"})
+                insert_idx = i
                 break
+        messages.insert(insert_idx, {
+            "role": "system",
+            "content": f"Current menu context for this order:\n{rag_ctx}"
+        })
 
-    resp = await chat_complete(messages, tools=TOOL_SCHEMAS, tool_choice="auto", stream=False)
+    # ── Detect if all order details are confirmed → force place_order ─────────
+    order_params  = state.get("order_params") or {}
+    order_type    = order_params.get("order_type")
+    is_cod        = order_params.get("is_cod")
+    has_address   = bool(order_params.get("delivery_address"))
+    has_restaurant = bool(order_params.get("restaurant_name"))
+    has_items      = bool(order_params.get("items"))
+    has_order_type = order_type in ("delivery", "pickup", "dinein")
+    has_payment    = is_cod is not None
+
+    # log.info("llm_node_order_params_snapshot", extra={
+    #     "restaurant":       order_params.get("restaurant_name"),
+    #     "order_type":       order_params.get("order_type"),
+    #     "is_cod":           order_params.get("is_cod"),
+    #     "has_address":      bool(order_params.get("delivery_address")),
+    #     "has_saved_addrs":  bool(order_params.get("_saved_addresses")),
+    #     "items":            len(order_params.get("items") or []),
+    # })
+
+    # All details confirmed including address → force place_order
+    all_confirmed = (
+        has_restaurant and has_items and has_order_type
+        and has_payment and has_address
+    )
+
+    # Know it's delivery, have items+restaurant, but no address yet → force get_user_addresses
+    # Trigger even if is_cod is still unknown — LLM will ask payment after address
+    needs_address = (
+        has_restaurant and has_items
+        and order_type == "delivery"
+        and has_payment
+        and not has_address
+    )
+
+    if all_confirmed:
+        tool_choice = {"type": "function", "function": {"name": "place_order"}}
+        log.info("llm_forcing_place_order", extra={
+            "restaurant": order_params.get("restaurant_name"),
+            "order_type": order_type,
+            "is_cod":     is_cod,
+        })
+    elif needs_address:
+        tool_choice = {"type": "function", "function": {"name": "get_user_addresses"}}
+        log.info("llm_forcing_get_user_addresses", extra={
+            "restaurant": order_params.get("restaurant_name"),
+        })
+    else:
+        tool_choice = "auto"
+        log.info("llm_auto_mode", extra={
+            "restaurant":  order_params.get("restaurant_name"),
+            "order_type":  order_type,
+            "is_cod":      is_cod,
+            "has_address": has_address,
+        })
+
+    resp = await chat_complete(
+        messages,
+        tools=TOOL_SCHEMAS,
+        tool_choice=tool_choice,
+        stream=False,
+    )
     choice = resp.choices[0]
     msg = choice.message
 
@@ -368,6 +449,7 @@ async def llm_node(state: GraphState) -> dict[str, Any]:
             "has_tool_calls": bool(msg.tool_calls),
             "n_tool_calls": len(msg.tool_calls or []),
             "content_len": len(msg.content or ""),
+            "forced": all_confirmed,
         },
     )
 
@@ -383,7 +465,16 @@ async def tools_node(state: GraphState) -> dict[str, Any]:
     tool_calls = last_msg.get("tool_calls", [])
     jwt_token = state.get("jwt_token", "")
 
+    # JWT presence check — confirms token flows end-to-end
+    log.info("tools_node_jwt_check", extra={
+        "jwt_present": bool(jwt_token),
+        "jwt_prefix":  jwt_token[:20] if jwt_token else "EMPTY",
+        "n_tool_calls": len(tool_calls),
+    })
+
     tool_messages: list[dict[str, Any]] = []
+    updated_order_params = dict(state.get("order_params") or {})
+
     for tc in tool_calls:
         name = tc["function"]["name"]
 
@@ -402,17 +493,44 @@ async def tools_node(state: GraphState) -> dict[str, Any]:
 
         log.info("tool_invoke", extra={"tool": name, "tool_call_id": tc["id"]})
         result = await execute_tool(name, args)
-        tool_messages.append(
-            {
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "name": name,
-                "content": result,
-            }
-        )
+
+        # When LLM calls place_order, capture delivery_address it used
+        # so order_params stays in sync for the forced-tool-call detection
+        if name == "place_order":
+            try:
+                place_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                if place_args.get("delivery_address"):
+                    updated_order_params["delivery_address"] = place_args["delivery_address"]
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+        if name == "get_user_addresses":
+            try:
+                addr_result = json.loads(result)
+                log.info("addresses_fetched", extra={
+                    "success": addr_result.get("success"),
+                    "count":   addr_result.get("total", 0),
+                })
+                # Cache addresses in order_params so next turn can resolve selection
+                if addr_result.get("success") and addr_result.get("addresses"):
+                    updated_order_params["_saved_addresses"] = addr_result["addresses"]
+
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+        tool_messages.append({
+            "role":         "tool",
+            "tool_call_id": tc["id"],
+            "name":         name,
+            "content":      result,
+        })
 
     iters = state.get("tool_iterations", 0) + 1
-    return {"messages": tool_messages, "tool_iterations": iters}
+    return {
+        "messages":        tool_messages,
+        "tool_iterations": iters,
+        "order_params":    updated_order_params,
+    }
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -451,6 +569,8 @@ def route_after_retrieve(state: GraphState) -> str:
 
 
 
+# REPLACE should_continue():
+
 def should_continue(state: GraphState) -> str:
     """After llm_node: loop to tools or end."""
     last_msg = state["messages"][-1]
@@ -458,32 +578,55 @@ def should_continue(state: GraphState) -> str:
     iters = state.get("tool_iterations", 0)
     max_iters = get_settings().max_tool_iterations
 
-    if has_tool_calls and iters < max_iters:
-        return "tools"
-    if has_tool_calls and iters >= max_iters:
+    if not has_tool_calls:
+        return END
+
+    if iters >= max_iters:
         log.warning("tool_loop_exhausted", extra={"iterations": iters})
         return END
-    return END
+
+    return "tools"
+
+
+# REPLACE should_continue_after_tools:
+def should_continue_after_tools(state: GraphState) -> str:
+    messages = state["messages"]
+    recent_tool_names = []
+    for m in reversed(messages):
+        if m.get("role") == "tool":
+            recent_tool_names.append(m.get("name"))
+        elif m.get("role") == "assistant" and m.get("tool_calls"):
+            break
+
+    # End turn after get_user_addresses — need user to pick address
+    if "get_user_addresses" in recent_tool_names:
+        log.info("pausing_after_get_user_addresses")
+        return END
+
+    # End turn after place_order — order is done
+    if "place_order" in recent_tool_names:
+        log.info("pausing_after_place_order")
+        return END
+
+    return "llm"
 
 
 # ────────────────────────────────────────────────────────────────────────────
 # Graph build
 # ────────────────────────────────────────────────────────────────────────────
 
+# REPLACE build_graph() entirely:
 def build_graph():
     g = StateGraph(GraphState)
 
-    # Register nodes
     g.add_node("intent", intent_node)
     g.add_node("collect_params", collect_params_node)
     g.add_node("retrieve", retrieve_node)
     g.add_node("llm", llm_node)
     g.add_node("tools", tools_node)
 
-    # Entry point
     g.set_entry_point("intent")
 
-    # Intent → collect_params (order_food) or retrieve (everything else)
     g.add_conditional_edges(
         "intent",
         route_intent,
@@ -493,7 +636,6 @@ def build_graph():
         },
     )
 
-    # collect_params → retrieve (complete) or END (needs more info)
     g.add_conditional_edges(
         "collect_params",
         route_after_collect_params,
@@ -503,28 +645,27 @@ def build_graph():
         },
     )
 
-    # retrieve → llm, or END if restaurant/item not found
     g.add_conditional_edges(
         "retrieve",
         route_after_retrieve,
         {"llm": "llm", END: END},
     )
 
-    # llm → tools loop or end
     g.add_conditional_edges(
         "llm",
         should_continue,
         {"tools": "tools", END: END},
     )
 
-    # tools always loop back to llm
-    g.add_edge("tools", "llm")
+    g.add_conditional_edges(
+        "tools",
+        should_continue_after_tools,
+        {"llm": "llm", END: END},
+    )
 
     return g.compile()
 
-
 _graph = None
-
 
 def get_graph():
     global _graph
@@ -537,13 +678,41 @@ def get_graph():
 # Public API
 # ────────────────────────────────────────────────────────────────────────────
 
+
+def _sanitize_history(history: list[dict]) -> list[dict]:
+    """Remove tool result messages that have no matching assistant tool_call.
+    
+    These orphans occur when a turn is paused after tool execution and the
+    assistant message with tool_calls didn't get persisted alongside the result.
+    """
+    # Collect all tool_call_ids that appear in assistant messages
+    valid_tool_call_ids: set[str] = set()
+    for m in history:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                valid_tool_call_ids.add(tc["id"])
+
+    sanitized = []
+    for m in history:
+        if m.get("role") == "tool":
+            if m.get("tool_call_id") in valid_tool_call_ids:
+                sanitized.append(m)
+            else:
+                log.warning("dropping_orphan_tool_message", extra={
+                    "name": m.get("name"),
+                    "tool_call_id": m.get("tool_call_id"),
+                })
+        else:
+            sanitized.append(m)
+    return sanitized
+
+
 def build_initial_messages(
     history: list[dict[str, Any]],
     user_message: str,
 ) -> list[dict[str, Any]]:
-    """Prepend system prompt, append the new user message."""
     msgs: list[dict[str, Any]] = [{"role": "system", "content": AKI_SYSTEM_PROMPT}]
-    msgs.extend(history)
+    msgs.extend(_sanitize_history(history))
     msgs.append({"role": "user", "content": user_message})
     return msgs
 
@@ -555,29 +724,6 @@ async def run_turn(
     order_params: Optional[dict[str, Any]] = None,
     jwt_token: str = "",
 ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
-    """Run a single conversational turn.
-
-    Args:
-        session_id:    Unique session identifier.
-        user_message:  Latest message from the user.
-        history:       Prior conversation messages from Valkey.
-        order_params:  Accumulated order parameters from Valkey.
-        jwt_token:     JWT bearer token from the mobile app. Injected into
-                       auth-required tool calls transparently.
-
-    Returns:
-        (final_assistant_text, updated_history, updated_order_params)
-
-    History write rules
-    ───────────────────
-    • Normal LLM turns: all assistant + tool messages from state["messages"]
-      are appended to history (system messages stripped).
-    • collect_params incomplete turns: the LLM never ran, so state["messages"]
-      has no new assistant message. We manually append the clarifying question
-      so the user's next reply has context.
-    • RAG system injections: never written to state["messages"], so they never
-      appear in history.
-    """
     graph = get_graph()
     initial_messages = build_initial_messages(history, user_message)
 
@@ -594,37 +740,73 @@ async def run_turn(
     )
 
     final_text = final_state.get("final_text") or ""
-    if not final_text:
-        final_text = "Sorry, I had trouble completing that. Could you rephrase?"
 
     # ── Rebuild Valkey history ────────────────────────────────────────────────
-    # Strip system prompts. Everything else — user, assistant, tool — is kept.
     new_messages: list[dict[str, Any]] = []
     for m in final_state["messages"]:
         if m.get("role") == "system":
             continue
         new_messages.append(m)
 
-    # If the turn ended at collect_params (params incomplete, LLM never ran),
-    # state["messages"] has no new assistant message. Append the clarifying
-    # question manually so the user's next reply lands in the right context.
+    # ── Build final_text from get_user_addresses result if LLM didn't set it ──
+    # This fires when should_continue_after_tools returned END after the tool ran,
+    # so the LLM never produced a text response.
+    addr_tool_msg = None
+    for m in new_messages:
+        if m.get("role") == "tool" and m.get("name") == "get_user_addresses":
+            addr_tool_msg = m
+            break
+
+    if addr_tool_msg and not final_text:
+        try:
+            addr_data = json.loads(addr_tool_msg.get("content", "{}"))
+            addresses = addr_data.get("addresses", [])
+            if addresses:
+                lines = ["Here are your saved addresses:"]
+                for i, addr in enumerate(addresses, 1):
+                    label = addr.get("label") or f"Address {i}"
+                    full  = addr.get("full_address", "")
+                    city  = addr.get("city", "")
+                    lines.append(f"{i}. {label} — {full}, {city}")
+                lines.append("\nWhich address would you like to deliver to?")
+                final_text = "\n".join(lines)
+            else:
+                final_text = "You don't have any saved addresses. Could you provide your delivery address?"
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+    if not final_text:
+        final_text = "Sorry, I had trouble completing that. Could you rephrase?"
+
+    # ── Append assistant message to history when LLM didn't produce one ───────
     intent = final_state.get("intent", "general")
     params_complete_flag = final_state.get("params_complete", False)
     tool_ran = any(m.get("role") == "tool" for m in new_messages)
-    retrieve_short_circuited = bool(
-        final_state.get("restaurant_not_found")
-        or (final_state.get("final_text") and not final_state.get("rag_context")
-            and not tool_ran and intent == "order_food" and params_complete_flag)
+    last_msg_is_assistant = (
+        new_messages and new_messages[-1].get("role") == "assistant"
     )
 
-    # If the turn ended at collect_params (params incomplete, LLM never ran),
-    # append the clarifying question so the user's next reply has context.
+    retrieve_short_circuited = bool(
+        final_state.get("restaurant_not_found")
+        or (
+            final_state.get("final_text")
+            and not final_state.get("rag_context")
+            and not tool_ran
+            and intent == "order_food"
+            and params_complete_flag
+        )
+    )
+
+    # collect_params ended the turn — append clarifying question
     if intent == "order_food" and not params_complete_flag and not tool_ran and final_text:
         new_messages.append({"role": "assistant", "content": final_text})
 
-    # If the turn ended at retrieve (restaurant/item not found, LLM never ran),
-    # append the not-found message so history stays coherent.
+    # retrieve short-circuited — append not-found message
     elif retrieve_short_circuited and final_text:
+        new_messages.append({"role": "assistant", "content": final_text})
+
+    # tools ended the turn (get_user_addresses or place_order) — append summary
+    elif tool_ran and not last_msg_is_assistant and final_text:
         new_messages.append({"role": "assistant", "content": final_text})
 
     # ── Reset order_params if order was successfully placed ───────────────────
