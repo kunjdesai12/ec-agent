@@ -7,7 +7,10 @@ from typing import Any
 
 from agent.app.llm import chat_complete
 from agent.app.logging_setup import get_logger
-from agent.app.state.order_state import ( OrderParams, merge_order_params, params_complete, missing_fields_message, should_clear_items)
+from agent.app.state.order_state import (
+    OrderParams, merge_order_params, params_complete,
+    missing_fields_message, should_clear_items,
+)
 
 log = get_logger(__name__)
 
@@ -59,16 +62,13 @@ def _should_reclassify(user_message: str, current_intent: str) -> bool:
     """
     lower = user_message.lower()
 
-    # Always reclassify on explicit reset phrases
     if any(phrase in lower for phrase in _ALWAYS_RECLASSIFY):
         return True
 
-    # Check if user is explicitly switching away from current intent
     switch_signals = _SWITCH_SIGNALS.get(current_intent, [])
     if any(signal in lower for signal in switch_signals):
         return True
 
-    # Otherwise keep the sticky intent
     return False
 
 
@@ -129,7 +129,6 @@ async def intent_node(state: dict[str, Any]) -> dict[str, Any]:
     )
 
     # ── Store active intent in order_params so it persists across turns ───────
-    # Only set/update when intent is actionable (not general/cancel)
     if intent in ("order_food", "check_order_status", "cancel_order"):
         order_params["active_intent"] = intent
 
@@ -215,27 +214,37 @@ async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
     when all details are confirmed and force the place_order tool call.
 
     NOTE: This node never writes to state["messages"].
+
+    Item rejection flow:
+    - When retrieve_node finds the requested item isn't available, it sets
+      item_rejected=True in GraphState. run_turn() persists this into
+      order_params so it survives the Valkey round-trip.
+    - On the next turn, we detect item_rejected in order_params and clear
+      the stale items[] before merging the user's new item selection.
+      This ensures "biryani" doesn't persist when the user switches to "dosa".
+    - The flag is consumed (popped) immediately so it only fires once.
     """
     user_message = state["user_message"]
     history = state.get("messages", [])
-
-    clean_history = [
-        m for m in history
-        if m.get("role") in ("user", "assistant") and not m.get("tool_calls")
-    ]
-
-        # The current user_message is already in clean_history (added by
-    # build_initial_messages). Strip it from the tail before passing to
-    # _extract_params, which appends it explicitly.
-    if clean_history and clean_history[-1].get("content") == user_message:
-        clean_history = clean_history[:-1]
-
-    extracted = await _extract_params(user_message, clean_history)
-
     existing: OrderParams = state.get("order_params") or {}
 
-    # ── Clear stale items if user is changing their selection ─────────────────
-    if should_clear_items(user_message):
+    # ── Clear stale items if previous turn rejected the requested item ────────
+    # item_rejected is stored in order_params by run_turn() so it survives
+    # the Valkey round-trip. Takes priority over should_clear_items() since
+    # the user may simply say "dosa" without any explicit "instead of" signal.
+    item_rejected = state.get("item_rejected") or existing.get("item_rejected", False)
+    if item_rejected:
+        existing = dict(existing)
+        existing["items"] = []
+        existing.pop("item_rejected", None)   # consume — only fires once
+        log.info("items_cleared_after_rejection", extra={
+            "restaurant": existing.get("restaurant_name"),
+        })
+
+    # ── Clear stale items if user explicitly signals a change ─────────────────
+    # Handles phrases like "instead of", "change my order", "swap" etc.
+    # Only runs if item_rejected didn't already clear items above.
+    elif should_clear_items(user_message):
         existing = dict(existing)
         existing["items"] = []
         log.info("items_cleared", extra={
@@ -243,10 +252,21 @@ async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
             "msg": user_message[:80],
         })
 
+    # ── Strip duplicate user message from history tail ────────────────────────
+    # build_initial_messages already appended the current user_message to
+    # state["messages"]. _extract_params also appends it explicitly, so
+    # remove it from the tail of clean_history to avoid sending it twice.
+    clean_history = [
+        m for m in history
+        if m.get("role") in ("user", "assistant") and not m.get("tool_calls")
+    ]
+    if clean_history and clean_history[-1].get("content") == user_message:
+        clean_history = clean_history[:-1]
+
+    extracted = await _extract_params(user_message, clean_history)
     merged = merge_order_params(existing, extracted)
 
     # ── Persist order_type and is_cod from extraction into order_params ───────
-    # These are not handled by merge_order_params since they're new fields.
     # Only overwrite if the extractor found a value (don't clear existing).
     if extracted.get("order_type") is not None:
         merged["order_type"] = extracted["order_type"]
@@ -258,7 +278,7 @@ async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
         extra={
             "restaurant": merged.get("restaurant_name"),
             "item_count": len(merged.get("items", [])),
-            "order_type":  merged.get("order_type"),
+            "order_type": merged.get("order_type"),
             "is_cod": merged.get("is_cod"),
         },
     )
@@ -267,7 +287,7 @@ async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
         return {
             "order_params": merged,
             "params_complete": True,
-            # No messages written — graph continues to semantic_match → llm
+            # No messages written — graph continues to retrieve → llm
         }
     else:
         ask_text = missing_fields_message(merged)
@@ -276,4 +296,5 @@ async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
             "order_params": merged,
             "params_complete": False,
             "final_text": ask_text,
+            # No messages written — run_turn() appends this to Valkey history
         }
