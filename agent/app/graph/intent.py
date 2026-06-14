@@ -131,7 +131,7 @@ async def intent_node(state: dict[str, Any]) -> dict[str, Any]:
     # ── Store active intent in order_params so it persists across turns ───────
     # Only set/update when intent is actionable (not general/cancel)
     if intent in ("order_food", "check_order_status", "cancel_order"):
-    order_params["active_intent"] = intent
+        order_params["active_intent"] = intent
 
     return {
         "intent": intent,
