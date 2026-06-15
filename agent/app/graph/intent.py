@@ -7,7 +7,10 @@ from typing import Any
 
 from agent.app.llm import chat_complete
 from agent.app.logging_setup import get_logger
-from agent.app.state.order_state import OrderParams, merge_order_params, params_complete, missing_fields_message
+from agent.app.state.order_state import (
+    OrderParams, merge_order_params, params_complete,
+    missing_fields_message, should_clear_items,
+)
 
 log = get_logger(__name__)
 
@@ -20,7 +23,7 @@ You are an intent classifier for a food ordering assistant.
 Classify the user message into exactly one of these intents:
 - order_food         : user wants to place a new food order
 - check_order_status : user wants to check status of an existing order
-- cancel_intent      : user wants to cancel or start over
+- cancel_order       : user wants to cancel an existing order
 - general            : anything else (discovery, questions, greetings, complaints)
 
 Respond with ONLY a JSON object, nothing else:
@@ -36,6 +39,10 @@ _SWITCH_SIGNALS = {
     "check_order_status": [
         "order food", "i want to order", "place order",
         "get me", "i'll have", "cancel", "start over", "never mind",
+    ],
+    "cancel_order": [
+        "order food", "i want to order", "place order",
+        "start over", "never mind", "forget it",
     ],
 }
 
@@ -55,83 +62,76 @@ def _should_reclassify(user_message: str, current_intent: str) -> bool:
     """
     lower = user_message.lower()
 
-    # Always reclassify on explicit reset phrases
     if any(phrase in lower for phrase in _ALWAYS_RECLASSIFY):
         return True
 
-    # Check if user is explicitly switching away from current intent
     switch_signals = _SWITCH_SIGNALS.get(current_intent, [])
     if any(signal in lower for signal in switch_signals):
         return True
 
-    # Otherwise keep the sticky intent
     return False
 
 
 async def intent_node(state: dict[str, Any]) -> dict[str, Any]:
     """
-    Classify user message intent with sticky intent support.
-
-    If an intent is already active (stored in order_params),
-    reuse it unless the user explicitly signals a switch.
-    This prevents mid-order messages like "yes", "2 please",
-    "14 Alkapuri" from being misclassified as 'general'.
+    Classify intent with sticky support. Sticky is a FALLBACK, not an override:
+    we always classify, and only fall back to the active intent when the fresh
+    result is ambiguous ('general'). This keeps mid-flow filler ("yes", "2 please",
+    "14 Alkapuri") in the active flow while still allowing a clear new request
+    ("get me biryani from honest") to switch intents.
     """
     user_message = state["user_message"]
     order_params: OrderParams = state.get("order_params") or {}
+    active_intent = order_params.get("active_intent")
 
-    # ── Sticky intent check ───────────────────────────────────────────────────
-    current_intent = order_params.get("active_intent")
-
-    if current_intent and not _should_reclassify(user_message, current_intent):
-        log.info(
-            "intent_sticky",
-            extra={"intent": current_intent, "user_msg": user_message[:80]},
-        )
-        return {"intent": current_intent}
-
-    # ── Fresh classification ──────────────────────────────────────────────────
+    # ── Always classify fresh ─────────────────────────────────────────────
     resp = await chat_complete(
         [
             {"role": "system", "content": _INTENT_SYSTEM},
             {"role": "user", "content": user_message},
         ],
-        tools=None,
-        tool_choice=None,
-        stream=False,
+        tools=None, tool_choice=None, stream=False,
     )
-
     raw = (resp.choices[0].message.content or "").strip()
     try:
         data = json.loads(raw)
-        intent = data.get("intent", "general")
+        fresh = data.get("intent", "general")
     except (json.JSONDecodeError, AttributeError):
         lower = user_message.lower()
         if any(w in lower for w in ["order", "want", "buy", "get me", "parcel"]):
-            intent = "order_food"
+            fresh = "order_food"
         elif any(w in lower for w in ["status", "track", "where is", "my order"]):
-            intent = "check_order_status"
+            fresh = "check_order_status"
+        elif any(w in lower for w in ["cancel", "cancellation", "stop order"]):
+            fresh = "cancel_order"
         else:
-            intent = "general"
+            fresh = "general"
 
-    log.info(
-        "intent_classified",
-        extra={"intent": intent, "user_msg": user_message[:80]},
-    )
-
-    # ── Store active intent in order_params so it persists across turns ───────
-    # Only set/update when intent is actionable (not general/cancel)
-    if intent in ("order_food", "check_order_status"):
+    # ── Sticky as fallback, not override ──────────────────────────────────
+    ACTIONABLE = ("order_food", "check_order_status", "cancel_order")
+    if fresh in ACTIONABLE:
+        intent = fresh                              # clear intent → honor / switch
+        if active_intent and fresh != active_intent:
+            log.info("intent_switched", extra={
+                "from": active_intent, "to": fresh, "user_msg": user_message[:80]})
+            # Intent changed → abandon the previous flow's order scratch so a
+            # new order doesn't inherit stale restaurant/items.
+            order_params = {"active_intent": fresh}
+        else:
+            order_params["active_intent"] = fresh
+            log.info("intent_classified", extra={
+                "intent": intent, "user_msg": user_message[:80]})
         order_params["active_intent"] = intent
-    elif intent == "cancel_intent":
-        # Clear sticky intent and order params on explicit cancel
-        order_params["active_intent"] = None
-        log.info("intent_reset", extra={"reason": "cancel_intent"})
+    elif active_intent:
+        intent = active_intent                      # ambiguous → stay in flow
+        log.info("intent_sticky", extra={
+            "intent": intent, "user_msg": user_message[:80]})
+    else:
+        intent = fresh                              # general, no active flow
+        log.info("intent_classified", extra={
+            "intent": intent, "user_msg": user_message[:80]})
 
-    return {
-        "intent": intent,
-        "order_params": order_params,
-    }
+    return {"intent": intent, "order_params": order_params}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,32 +139,45 @@ async def intent_node(state: dict[str, Any]) -> dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _EXTRACT_SYSTEM = """\
-Extract:
-- restaurant_name : name of the restaurant (string or null)
-- items           : list of objects with:
-                      - name: string
-                      - quantity: integer (defaults to 1)
-                      - special_instructions: string or null
-                        (e.g. "extra spicy", "no onions", "less oil")
-                    Only include special_instructions if the user explicitly
-                    said something about how the item should be prepared.
+Extract order parameters from the user message.
 
 Return ONLY a JSON object, nothing else:
 {
   "restaurant_name": "<name or null>",
   "items": [
-    {"name": "<item>", "quantity": <int>, "special_instructions": "<str or null>"},
-    ...
-  ]
+    {"name": "<item>", "quantity": <int>, "special_instructions": "<str or null>"}
+  ],
+  "order_type": "<delivery|pickup|dinein or null>",
+  "is_cod": <true|false|null>
 }
 
-If a field is not mentioned, use null for restaurant_name and [] for items.
+Extraction rules:
+- restaurant_name : name of the restaurant, or null if not mentioned
+- items           : list of food/drink items the user wants to order
+                    - name: item name (string)
+                    - quantity: how many (integer, defaults to 1)
+                    - special_instructions: only if user explicitly said how
+                      to prepare it (e.g. "extra spicy", "no onions"), else null
+- order_type      : "delivery" if user wants it delivered
+                    "pickup" if user says takeaway/pickup/take away/parcel/collect
+                    "dinein" if user says dine in/eat here/sit down
+                    null if not mentioned
+- is_cod          : true if user says cash/COD/cash on delivery
+                    false if user says online/card/UPI/digital payment
+                    null if not mentioned
+
 Do not invent values. Only extract what the user explicitly said.
+If a field is not mentioned, use null for strings and null for booleans.
 """
 
 
 async def _extract_params(user_message: str, history: list[dict]) -> dict[str, Any]:
-    """Use LLM to extract order params from current message + recent history."""
+    """Use LLM to extract order params from current message + recent history.
+
+    history should contain only clean user/assistant turns (no system prompts,
+    no tool messages, no tool_calls) — filtered by collect_params_node before
+    passing in.
+    """
     recent = history[-8:] if len(history) > 8 else history
     messages = [
         {"role": "system", "content": _EXTRACT_SYSTEM},
@@ -186,29 +199,90 @@ async def _extract_params(user_message: str, history: list[dict]) -> dict[str, A
         return json.loads(raw)
     except json.JSONDecodeError:
         log.warning("param_extraction_parse_failed", extra={"raw": raw[:200]})
-        return {"restaurant_name": None, "items": []}
+        return {"restaurant_name": None, "items": [], "order_type": None, "is_cod": None}
 
 
 async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
-    """Extract and accumulate order parameters."""
+    """Extract and accumulate order parameters.
+
+    Extracts: restaurant_name, items, order_type, is_cod from the user message.
+    order_type and is_cod are stored in order_params so llm_node can detect
+    when all details are confirmed and force the place_order tool call.
+
+    NOTE: This node never writes to state["messages"].
+
+    Item rejection flow:
+    - When retrieve_node finds the requested item isn't available, it sets
+      item_rejected=True in GraphState. run_turn() persists this into
+      order_params so it survives the Valkey round-trip.
+    - On the next turn, we detect item_rejected in order_params and clear
+      the stale items[] before merging the user's new item selection.
+      This ensures "biryani" doesn't persist when the user switches to "dosa".
+    - The flag is consumed (popped) immediately so it only fires once.
+    """
     user_message = state["user_message"]
     history = state.get("messages", [])
+    existing: OrderParams = state.get("order_params") or {}
+    suppress_history = False
+    # ── Clear stale items if previous turn rejected the requested item ────────
+    # item_rejected is stored in order_params by run_turn() so it survives
+    # the Valkey round-trip. Takes priority over should_clear_items() since
+    # the user may simply say "dosa" without any explicit "instead of" signal.
+    item_rejected = state.get("item_rejected") or existing.get("item_rejected", False)
+    if item_rejected:
+        existing = dict(existing)
+        existing["items"] = []
+        existing["restaurant_name"] = None   # the restaurant couldn't fulfill the
+                                             # request — don't pin the next item to
+                                             # it; let the search broaden across
+                                             # restaurants.
+        existing.pop("item_rejected", None)
+        suppress_history = True              # don't let the extractor re-pull the
+                                             # rejected item from history
+        log.info("items_cleared_after_rejection", extra={
+            "restaurant": existing.get("restaurant_name"),
+        })
 
+    # ── Clear stale items if user explicitly signals a change ─────────────────
+    # Handles phrases like "instead of", "change my order", "swap" etc.
+    # Only runs if item_rejected didn't already clear items above.
+    elif should_clear_items(user_message):
+        existing = dict(existing)
+        existing["items"] = []
+        suppress_history = True
+        log.info("items_cleared", extra={
+            "msg": user_message[:80],
+        })
+
+    # ── Strip duplicate user message from history tail ────────────────────────
+    # build_initial_messages already appended the current user_message to
+    # state["messages"]. _extract_params also appends it explicitly, so
+    # remove it from the tail of clean_history to avoid sending it twice.
     clean_history = [
         m for m in history
         if m.get("role") in ("user", "assistant") and not m.get("tool_calls")
     ]
-
-    extracted = await _extract_params(user_message, clean_history)
-
-    existing: OrderParams = state.get("order_params") or {}
+    if clean_history and clean_history[-1].get("content") == user_message:
+        clean_history = clean_history[:-1]
+    
+    history_for_extract = [] if suppress_history else clean_history
+    extracted = await _extract_params(user_message, history_for_extract)
     merged = merge_order_params(existing, extracted)
+
+    # ── Persist order_type and is_cod from extraction into order_params ───────
+    # Only overwrite if the extractor found a value (don't clear existing).
+    if extracted.get("order_type") is not None:
+        merged["order_type"] = extracted["order_type"]
+    if extracted.get("is_cod") is not None:
+        merged["is_cod"] = extracted["is_cod"]
 
     log.info(
         "params_collected",
         extra={
             "restaurant": merged.get("restaurant_name"),
-            "item_count": len(merged.get("items", [])),
+            "items": merged.get("items"),
+            "order_type": merged.get("order_type"),
+            "is_cod": merged.get("is_cod"),
         },
     )
 
@@ -216,6 +290,7 @@ async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
         return {
             "order_params": merged,
             "params_complete": True,
+            # No messages written — graph continues to retrieve → llm
         }
     else:
         ask_text = missing_fields_message(merged)
@@ -224,5 +299,5 @@ async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
             "order_params": merged,
             "params_complete": False,
             "final_text": ask_text,
-            "messages": [{"role": "assistant", "content": ask_text}],
+            # No messages written — run_turn() appends this to Valkey history
         }

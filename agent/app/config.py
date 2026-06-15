@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     vllm_request_timeout_s: float = 60.0
 
     # Generation
-    max_new_tokens: int = 400
+    max_new_tokens: int = 1000
     temperature: float = 0.3
     top_p: float = 0.9
 

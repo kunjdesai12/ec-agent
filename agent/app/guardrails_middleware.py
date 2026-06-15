@@ -2,9 +2,17 @@
 #
 # Place at: /data/ec-agent/agent/app/guardrails_middleware.py
 #
-# Wraps the Aki LangGraph pipeline with NeMo Guardrails input checks.
-# Only input rails are used here — LangGraph handles the actual response,
-# so no output rails are needed at this layer (keeps latency minimal).
+# Wraps the Aki LangGraph pipeline with input-side guardrail checks.
+# LangGraph handles the actual response, so only INPUT gating happens here.
+#
+# Guardrail layers (in order, fast to slow):
+#   1. Regex check       — zero latency, catches obvious violations
+#   2. Semantic classify — bge-m3 cosine over intent classes, no LLM call.
+#                          Scores the input against BOTH violation and benign
+#                          classes and blocks only when a violation wins above
+#                          a similarity floor. Replaces NeMo's dialog-intent
+#                          input rails (which force-matched every input to the
+#                          nearest violation, with no benign class / no floor).
 
 import os
 import logging
@@ -22,17 +30,13 @@ class AkiGuardrails:
     """
     Lightweight guardrail gate that sits in front of run_turn / stream_turn.
 
-    Only runs INPUT rails — jailbreak, off-topic, competitor, price manipulation.
-    LangGraph handles the actual Aki response unchanged.
-
-    Guardrail layers (in order, fast to slow):
-      1. Regex check      — zero latency, catches obvious violations
-      2. Semantic rail    — NeMo embedding similarity, ~10-20ms
-      3. LLM self-check   — Qwen via vLLM, ~200-400ms, only if needed
+    Runs INPUT checks only — jailbreak, off-topic, competitor, price
+    manipulation, abuse. LangGraph handles the actual Aki response unchanged.
     """
 
     def __init__(self):
         self.rails: Optional[LLMRails] = None
+        self.semantic = None
         self._initialized = False
 
     async def initialize(self):
@@ -61,6 +65,13 @@ class AkiGuardrails:
             self.rails.register_action(check_confirmation_given)
             self.rails.register_action(log_guardrail_violation)
 
+            # Semantic input classifier — reuse the retriever's bge-m3 instance
+            # (do NOT load a second copy; get_retriever() returns the singleton
+            # that main.py already warms up at startup).
+            from agent.app.guardrails_config.semantic_rail import SemanticRail
+            from agent.app.rag.retriever import get_retriever
+            self.semantic = SemanticRail(get_retriever().model)
+
             self._initialized = True
             log.info("guardrails_init_ready")
 
@@ -72,8 +83,8 @@ class AkiGuardrails:
 
     async def check_input(self, user_message: str, session_id: str) -> dict:
         """
-        Run input rails only against the user message.
-        Returns immediately if a rail fires — LangGraph is never called.
+        Run input checks against the user message.
+        Returns immediately if a check fires — LangGraph is never called.
 
         Returns:
             {
@@ -108,41 +119,27 @@ class AkiGuardrails:
                 "violation": violation,
             }
 
-        # ── Layer 2: NeMo semantic + LLM self-check ────────────────────────
+        # ── Layer 2: semantic classifier (bge-m3 cosine, no LLM) ───────────
         try:
-            result = await self.rails.generate_async(
-                messages=[{"role": "user", "content": user_message}],
-                options={
-                    "rails": ["input"],   # input rails only, no LLM generation
-                    "output_vars": True,
-                },
-            )
-
-            # If NeMo generated a canned response (rail fired), it means blocked
-            response_text = ""
-            if result.response:
-                response_text = result.response[-1].get("content", "")
-
-            # A rail fired if NeMo returned a canned bot response
-            # (not an empty string and not a passthrough)
-            blocked = bool(response_text) and not self._is_passthrough(response_text)
-            violation = result.context.get("violation_reason") if blocked else None
-
-            if blocked:
+            verdict = self.semantic.check(user_message)
+            if verdict["blocked"]:
+                violation = verdict["violation"]
                 log.info("guardrail_semantic_block", extra={
                     "session_id": session_id,
                     "violation":  violation,
+                    "score":      round(verdict["score"], 3),
                 })
-                await self._log_violation(session_id, user_message, violation or "semantic_rail")
+                await self._log_violation(session_id, user_message, violation)
+                return {
+                    "blocked":   True,
+                    "response":  self._blocked_response(violation),
+                    "violation": violation,
+                }
 
-            return {
-                "blocked":   blocked,
-                "response":  response_text if blocked else "",
-                "violation": violation,
-            }
+            return {"blocked": False, "response": "", "violation": None}
 
         except Exception as e:
-            # If NeMo check fails, log and pass through — don't break the chat
+            # If the semantic check fails, log and pass through — don't break chat
             log.error("guardrail_check_error", extra={"err": str(e), "session_id": session_id})
             return {"blocked": False, "response": "", "violation": None}
 
@@ -164,24 +161,16 @@ class AkiGuardrails:
                 "I'm Aki, EasyCater's food ordering assistant. "
                 "What would you like to eat today?"
             )
+        if "abusive" in violation:
+            return (
+                "I'm here to help with your food order. "
+                "What can I get started for you?"
+            )
         # Default off-topic / unsafe
         return (
             "I can only help with food orders on EasyCater. "
             "Would you like to see our menu?"
         )
-
-    def _is_passthrough(self, response: str) -> bool:
-        """
-        NeMo sometimes returns the original message unchanged when no rail fires.
-        Detect this so we don't treat it as a block.
-        """
-        passthrough_signals = [
-            "i want to order",
-            "show me the menu",
-            "what's available",
-        ]
-        r = response.lower()
-        return any(s in r for s in passthrough_signals)
 
     async def _log_violation(self, session_id: str, message: str, violation: str):
         """Fire-and-forget violation log."""

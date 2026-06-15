@@ -152,24 +152,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "enum": ["delivery", "pickup", "dinein"],
                         "description": "Type of order being placed."
                     },
-                    # "customer_details": {
-                    #     "type": "object",
-                    #     "properties": {
-                    #         "name": {
-                    #             "type": "string",
-                    #             "description": "Customer full name."
-                    #         },
-                    #         "email": {
-                    #             "type": "string",
-                    #             "description": "Customer email address."
-                    #         },
-                    #         "phone": {
-                    #             "type": "string",
-                    #             "description": "Customer contact number."
-                    #         }
-                    #     },
-                    #     "required": ["name", "email", "phone"]
-                    # },
                     "delivery_address": {
                         "type": "object",
                         "properties": {
@@ -229,10 +211,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "type": "string",
                         "description": "Special cooking or delivery instructions."
                     },
-                    # "jwt_token": {
-                    #     "type": "string",
-                    #     "description": "JWT access token for authenticated API requests."
-                    # }
                 },
                 "required": [
                     "restaurant_id",
@@ -259,10 +237,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "type": "integer",
                         "description": "Unique order ID"
                     },
-                    # "jwt_token": {
-                    #     "type": "string",
-                    #     "description": "JWT bearer token for authenticated user"
-                    # }
                 },
                 "required": ["order_id"]
             }
@@ -274,21 +248,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "name": "get_active_orders",
             "description": (
                 "Fetch the current user's active orders. "
-                "Call this FIRST when user wants to cancel but hasn't provided an order_id. "
+                "Call this for fetching user's active orders or when user wants to cancel but hasn't provided an order_id. "
                 "Returns list of active orders with order_id, status, restaurant name, "
                 "items, total amount and scheduled time. "
                 "If multiple orders exist, show them to user and ask which one to cancel."
             ),
-            # "parameters": {
-            #     "type": "object",
-            #     "properties": {
-            #         "jwt_token": {
-            #             "type": "string",
-            #             "description": "JWT bearer token for the authenticated user."
-            #         }
-            #     },
-            #     "required": ["jwt_token"]
-            # }
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -310,7 +274,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "  - Refund is triggered automatically via Razorpay. "
                 "If cancellation is not allowed, backend returns a clear error — "
                 "pass it directly to the user. "
-                "Always call get_active_orders first if you don't have the order_id."
+                "Always call get_active_orders first if you don't have the order_id. "
+                "Use this ONLY for orders already PLACED (which have an order_id). "
+                "To cancel an order the user is still building (the scratchpad / "
+                "CURRENT ORDER), use discard_current_order instead."
             ),
             "parameters": {
                 "type": "object",
@@ -323,14 +290,23 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "type": "string",
                         "description": "Reason for cancellation. Ask the user if not provided."
                     },
-                    # "jwt_token": {
-                    #     "type": "string",
-                    #     "description": "JWT bearer token for the authenticated user."
-                    # }
                 },
                 "required": ["order_id", "reason"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "discard_current_order",
+            "description": (
+            "Discard the in-progress order the user is currently building (the "
+            "scratchpad shown in CURRENT ORDER). Use this — NOT cancel_order — when "
+            "the user wants to cancel/clear the order they haven't placed yet. This "
+            "order has no order_id and does not exist in the backend."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
     },
     {
         "type": "function",
@@ -726,6 +702,7 @@ async def _get_active_orders(args: dict[str, Any]) -> dict[str, Any]:
 
     headers = _auth_headers(jwt_token)
 
+    data = None
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.get(
@@ -736,23 +713,40 @@ async def _get_active_orders(args: dict[str, Any]) -> dict[str, Any]:
             response.raise_for_status()
             data = response.json()
 
-        orders_raw = (
-            data.get("data")
-            or data.get("orders")
-            or data.get("result")
-            or []
-        )
+        # ── Normalize to a list of order dicts, whatever the API returns ──────
+        if isinstance(data, dict):
+            orders_raw = (
+                data.get("data")
+                or data.get("orders")
+                or data.get("result")
+                or []
+            )
+        elif isinstance(data, list):
+            orders_raw = data            # API returned the list directly
+        else:
+            orders_raw = []              # string / null / unexpected
+
+        if isinstance(orders_raw, dict):
+            orders_raw = [orders_raw]    # single order returned as a dict
+        elif not isinstance(orders_raw, list):
+            orders_raw = []              # message string / null → no orders
 
         if not orders_raw:
             return {
                 "success": True,
                 "active_orders": [],
                 "count": 0,
-                "message": "No active orders found."
+                "message": "No active orders found.",
+                "_debug": {                          # ← temporary, remove later
+                    "data_type": type(data).__name__,
+                    "raw": str(data)[:400],
+                },
             }
 
         active_orders = []
         for order in orders_raw:
+            if not isinstance(order, dict):
+                continue                 # skip stray strings/None defensively
             active_orders.append({
                 "order_id":        order.get("order_id") or order.get("id"),
                 "status":          order.get("status", "unknown"),
@@ -761,7 +755,7 @@ async def _get_active_orders(args: dict[str, Any]) -> dict[str, Any]:
                 "scheduled_date":  order.get("order_schedule_date", ""),
                 "scheduled_time":  order.get("order_schedule_time", ""),
                 "restaurant_name": (
-                    order.get("restaurant", {}).get("restaurant_name")
+                    (order.get("restaurant") or {}).get("restaurant_name")
                     or order.get("restaurant_name", "Unknown Restaurant")
                 ),
                 "items": [
@@ -771,6 +765,7 @@ async def _get_active_orders(args: dict[str, Any]) -> dict[str, Any]:
                         "price":    item.get("price", 0),
                     }
                     for item in (order.get("order_items") or order.get("items") or [])
+                    if isinstance(item, dict)
                 ],
                 "placed_at": order.get("createdAt") or order.get("created_at", ""),
             })
@@ -778,14 +773,18 @@ async def _get_active_orders(args: dict[str, Any]) -> dict[str, Any]:
         return {
             "success":       True,
             "active_orders": active_orders,
-            "count":         len(active_orders)
+            "count":         len(active_orders),
         }
 
     except httpx.HTTPStatusError as e:
         return {"success": False, "error": f"API error {e.response.status_code}"}
     except Exception as e:
-        return {"success": False, "error": f"Failed to fetch active orders: {str(e)}"}
-
+        return {
+            "success": False,
+            "error": f"Failed to fetch active orders: {str(e)}",
+            "_debug_type": type(data).__name__ if data is not None else "unset",
+            "_debug_raw": str(data)[:400] if data is not None else "",
+        }
 
 async def _cancel_order(args: dict[str, Any]) -> dict[str, Any]:
     """Cancel a food order.
@@ -797,7 +796,14 @@ async def _cancel_order(args: dict[str, Any]) -> dict[str, Any]:
     jwt_token = args.get("jwt_token", "")
 
     if not order_id:
-        return {"success": False, "error": "order_id is required."}
+        return {
+            "success": False,
+            "error": (
+                "order_id is required — call get_active_orders first to find the "
+                "order_id. If the user means an order they haven't placed yet, "
+                "use discard_current_order instead."
+            ),
+        }
     if not reason:
         return {"success": False, "error": "reason is required. Please ask the user why they want to cancel."}
     if not jwt_token:
@@ -842,6 +848,22 @@ async def _cancel_order(args: dict[str, Any]) -> dict[str, Any]:
 
     except Exception as e:
         return {"success": False, "cancelled": False, "error": f"Something went wrong: {str(e)}"}
+
+
+async def _discard_current_order(args: dict[str, Any]) -> dict[str, Any]:
+    """Discard the in-progress (scratchpad) order.
+
+    This is purely a LOCAL state operation — no backend call. The actual
+    clearing of order_params happens in run_turn() via the TERMINAL_TOOLS
+    reset when this tool returns success. This handler just acknowledges so
+    the model gets a clean success it can confirm to the user.
+    """
+    return {
+        "success":   True,
+        "discarded": True,
+        "message":   "Your in-progress order has been cleared.",
+    }
+
 
 async def _get_user_addresses(args: dict[str, Any]) -> dict[str, Any]:
     """Fetch user's saved delivery addresses.
@@ -916,6 +938,7 @@ HANDLERS: dict[str, ToolHandler] = {
     "get_order_status": _get_order_status,
     "get_active_orders": _get_active_orders,
     "cancel_order": _cancel_order,
+    "discard_current_order": _discard_current_order,
     "get_user_addresses": _get_user_addresses,
 }
 
