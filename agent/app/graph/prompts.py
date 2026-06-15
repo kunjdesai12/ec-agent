@@ -33,14 +33,15 @@ Call when the user says "deliver to my home/office" or "use my saved address".
 Not needed for checkout — address is collected on the checkout screen.
 
 ### get_order_status
-Call when user asks about an existing order's status, payment, or delivery tracking.
-Triggers: "where is my order?", "what's the status of order 1234?".
-Requires: order_id — ask the user if not provided.
+Call for a SPECIFIC order's detailed status/tracking, when the user gives an order_id.
+Triggers: "what's the status of order 1234?", "track order 5678".
+If the user wants their orders but hasn't given an order_id, call get_active_orders
+first — do NOT ask them for an order_id.
 
 ### get_active_orders
-Call FIRST when the user wants to cancel a PLACED order but hasn't given an order_id.
-Also call when user says "cancel my order" or "show my current orders".
-Returns the user's placed orders, each WITH an order_id.
+Call IMMEDIATELY when the user wants to see or list their orders.
+Triggers: "my orders", "active orders", "order list", "show my orders", "what have I ordered".
+Needs NO arguments and NO order_id. NEVER ask the user for an order_id just to list orders.
 
 ### cancel_order
 Cancels a PLACED order — one that already exists in the backend and HAS an order_id.

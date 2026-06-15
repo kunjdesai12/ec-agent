@@ -223,7 +223,7 @@ async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
     user_message = state["user_message"]
     history = state.get("messages", [])
     existing: OrderParams = state.get("order_params") or {}
-
+    suppress_history = False
     # ── Clear stale items if previous turn rejected the requested item ────────
     # item_rejected is stored in order_params by run_turn() so it survives
     # the Valkey round-trip. Takes priority over should_clear_items() since
@@ -232,7 +232,13 @@ async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
     if item_rejected:
         existing = dict(existing)
         existing["items"] = []
-        existing.pop("item_rejected", None)   # consume — only fires once
+        existing["restaurant_name"] = None   # the restaurant couldn't fulfill the
+                                             # request — don't pin the next item to
+                                             # it; let the search broaden across
+                                             # restaurants.
+        existing.pop("item_rejected", None)
+        suppress_history = True              # don't let the extractor re-pull the
+                                             # rejected item from history
         log.info("items_cleared_after_rejection", extra={
             "restaurant": existing.get("restaurant_name"),
         })
@@ -243,8 +249,8 @@ async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
     elif should_clear_items(user_message):
         existing = dict(existing)
         existing["items"] = []
+        suppress_history = True
         log.info("items_cleared", extra={
-            "reason": "change_signal_detected",
             "msg": user_message[:80],
         })
 
@@ -258,8 +264,9 @@ async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
     ]
     if clean_history and clean_history[-1].get("content") == user_message:
         clean_history = clean_history[:-1]
-
-    extracted = await _extract_params(user_message, clean_history)
+    
+    history_for_extract = [] if suppress_history else clean_history
+    extracted = await _extract_params(user_message, history_for_extract)
     merged = merge_order_params(existing, extracted)
 
     # ── Persist order_type and is_cod from extraction into order_params ───────

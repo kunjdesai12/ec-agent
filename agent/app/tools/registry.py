@@ -248,7 +248,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "name": "get_active_orders",
             "description": (
                 "Fetch the current user's active orders. "
-                "Call this FIRST when user wants to cancel but hasn't provided an order_id. "
+                "Call this for fetching user's active orders or when user wants to cancel but hasn't provided an order_id. "
                 "Returns list of active orders with order_id, status, restaurant name, "
                 "items, total amount and scheduled time. "
                 "If multiple orders exist, show them to user and ask which one to cancel."
@@ -702,6 +702,7 @@ async def _get_active_orders(args: dict[str, Any]) -> dict[str, Any]:
 
     headers = _auth_headers(jwt_token)
 
+    data = None
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.get(
@@ -712,23 +713,40 @@ async def _get_active_orders(args: dict[str, Any]) -> dict[str, Any]:
             response.raise_for_status()
             data = response.json()
 
-        orders_raw = (
-            data.get("data")
-            or data.get("orders")
-            or data.get("result")
-            or []
-        )
+        # ── Normalize to a list of order dicts, whatever the API returns ──────
+        if isinstance(data, dict):
+            orders_raw = (
+                data.get("data")
+                or data.get("orders")
+                or data.get("result")
+                or []
+            )
+        elif isinstance(data, list):
+            orders_raw = data            # API returned the list directly
+        else:
+            orders_raw = []              # string / null / unexpected
+
+        if isinstance(orders_raw, dict):
+            orders_raw = [orders_raw]    # single order returned as a dict
+        elif not isinstance(orders_raw, list):
+            orders_raw = []              # message string / null → no orders
 
         if not orders_raw:
             return {
                 "success": True,
                 "active_orders": [],
                 "count": 0,
-                "message": "No active orders found."
+                "message": "No active orders found.",
+                "_debug": {                          # ← temporary, remove later
+                    "data_type": type(data).__name__,
+                    "raw": str(data)[:400],
+                },
             }
 
         active_orders = []
         for order in orders_raw:
+            if not isinstance(order, dict):
+                continue                 # skip stray strings/None defensively
             active_orders.append({
                 "order_id":        order.get("order_id") or order.get("id"),
                 "status":          order.get("status", "unknown"),
@@ -737,7 +755,7 @@ async def _get_active_orders(args: dict[str, Any]) -> dict[str, Any]:
                 "scheduled_date":  order.get("order_schedule_date", ""),
                 "scheduled_time":  order.get("order_schedule_time", ""),
                 "restaurant_name": (
-                    order.get("restaurant", {}).get("restaurant_name")
+                    (order.get("restaurant") or {}).get("restaurant_name")
                     or order.get("restaurant_name", "Unknown Restaurant")
                 ),
                 "items": [
@@ -747,6 +765,7 @@ async def _get_active_orders(args: dict[str, Any]) -> dict[str, Any]:
                         "price":    item.get("price", 0),
                     }
                     for item in (order.get("order_items") or order.get("items") or [])
+                    if isinstance(item, dict)
                 ],
                 "placed_at": order.get("createdAt") or order.get("created_at", ""),
             })
@@ -754,14 +773,18 @@ async def _get_active_orders(args: dict[str, Any]) -> dict[str, Any]:
         return {
             "success":       True,
             "active_orders": active_orders,
-            "count":         len(active_orders)
+            "count":         len(active_orders),
         }
 
     except httpx.HTTPStatusError as e:
         return {"success": False, "error": f"API error {e.response.status_code}"}
     except Exception as e:
-        return {"success": False, "error": f"Failed to fetch active orders: {str(e)}"}
-
+        return {
+            "success": False,
+            "error": f"Failed to fetch active orders: {str(e)}",
+            "_debug_type": type(data).__name__ if data is not None else "unset",
+            "_debug_raw": str(data)[:400] if data is not None else "",
+        }
 
 async def _cancel_order(args: dict[str, Any]) -> dict[str, Any]:
     """Cancel a food order.

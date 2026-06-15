@@ -504,21 +504,32 @@ async def llm_node(state: GraphState) -> dict[str, Any]:
     update: dict[str, Any] = {"messages": [assistant_msg]}
     if not msg.tool_calls:
         content = msg.content or ""
-        update["final_text"] = content
 
-        # Detect confirmation signal — LLM says CONFIRMED on its own line
-        # when the user has acknowledged the order summary. Set items_confirmed
-        # in order_params so next turn short-circuits to checkout.
-        if "CONFIRMED" in [line.strip() for line in content.splitlines()]:
-            updated_params = dict(state.get("order_params") or {})
-            updated_params["items_confirmed"] = True
-            update["order_params"] = updated_params
-            # Strip the CONFIRMED line from what the user sees
-            visible_lines = [l for l in content.splitlines() if l.strip() != "CONFIRMED"]
-            update["final_text"] = "\n".join(visible_lines).strip()
-            log.info("items_confirmed_set", extra={
-                "restaurant": updated_params.get("restaurant_name"),
+        # Robust confirmation: the model sometimes appends CONFIRMED to other text
+        # or echoes a CHECKOUT_READY:: token it saw in history, so match the token
+        # anywhere — not just alone on a line.
+        if re.search(r"\bCONFIRMED\b", content):
+            op = state.get("order_params") or {}
+            items_list = op.get("items") or []
+            item_str = ", ".join(f"{it['quantity']}x {it['name']}" for it in items_list)
+            checkout_payload = json.dumps({
+                "restaurant_id": op.get("restaurant_id"),
+                "items": items_list,
             })
+            # Drop any hallucinated CHECKOUT_READY:: sentinel (and everything after
+            # it) plus the CONFIRMED token, so neither reaches the user or history.
+            visible = content.split("CHECKOUT_READY::")[0]
+            visible = re.sub(r"\bCONFIRMED\b", "", visible).strip()
+            log.info("checkout_ready", extra={
+                "restaurant": op.get("restaurant_name"), "items": item_str,
+            })
+            return {
+                "messages":       [{"role": "assistant", "content": f"CHECKOUT_READY::{checkout_payload}"}],
+                "final_text":     visible or f"Taking you to checkout for {item_str}.",
+                "checkout_ready": True,
+            }
+
+        update["final_text"] = content
 
     return update
 
@@ -778,11 +789,13 @@ async def run_turn(
 
     # ── Reset order_params on checkout handoff or successful place_order ────────
     updated_order_params = final_state.get("order_params") or {}
-
     # Checkout handoff — frontend takes over, clear order state
+    order_finished = bool(final_state.get("checkout_ready"))
+    
     if final_state.get("checkout_ready"):
         updated_order_params = {}
-        log.info("order_params_reset", extra={"reason": "checkout_ready"})
+        new_messages = []          # ← drop the finished order's history too
+        log.info("flow_reset", extra={"reason": "checkout_ready"})
 
    
     # ── Terminal tools — reset order_params (incl. active_intent) ─────────────
@@ -792,23 +805,22 @@ async def run_turn(
     # (e.g. a cancel that failed) does NOT reset, so the user stays in the flow
     # to retry.
     for m in new_messages:
-        if m.get("role") == "tool" and m.get("name") in TERMINAL_TOOLS:
-            try:
-                result = json.loads(m.get("content", "{}"))
-            except (json.JSONDecodeError, AttributeError):
-                result = {}
-            if result.get("success") is not False:
-                updated_order_params = {}
-                log.info("order_params_reset", extra={
-                    "reason": f"terminal_tool:{m.get('name')}",
-                })
-                break
+        if m.get("role") != "tool" or m.get("name") not in TERMINAL_TOOLS:
+            continue
+        try:
+            result = json.loads(m.get("content", "{}"))
+        except (json.JSONDecodeError, AttributeError):
+            result = {}
+        if result.get("success") is False:
+            continue
+        updated_order_params = {}
+        if m.get("name") in ("place_order", "cancel_order", "discard_current_order"):
+            order_finished = True
 
-    # ── Persist item_rejected into order_params for next turn ─────────────────
-    # collect_params_node reads this from order_params (not GraphState) because
-    # GraphState doesn't survive between turns — only Valkey does.
-    # The flag is consumed by collect_params_node on the next turn (popped after
-    # clearing items[]), so it only fires once.
+    if order_finished:
+        updated_order_params = {}
+        new_messages = []
+        log.info("flow_reset", extra={"reason": "order_finished"})
+
     updated_order_params["item_rejected"] = final_state.get("item_rejected", False)
-
     return final_text, new_messages, updated_order_params

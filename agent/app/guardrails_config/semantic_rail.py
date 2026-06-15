@@ -94,6 +94,13 @@ BENIGN_INTENTS: Dict[str, List[str]] = {
         "hi", "hello", "namaste", "hey aki", "good morning",
     ],
      "manage_order": [
+        "get me active orders",
+        "show my active orders",
+        "show my current orders",
+        "show my orders",
+        "list my orders",
+        "do I have any active orders",
+        "what are my active orders",
         "cancel order 123",
         "cancel my order",
         "yes please cancel order 123",
@@ -116,7 +123,7 @@ BLOCK_THRESHOLD = 0.55
 
 # Optional safety margin: require the top violation to beat the top benign
 # score by at least this much before blocking. Set to 0.0 to disable.
-BLOCK_MARGIN = 0.0
+BLOCK_MARGIN = 0.06
 
 
 class SemanticRail:
