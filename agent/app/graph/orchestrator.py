@@ -75,6 +75,10 @@ _AUTH_REQUIRED_TOOLS = frozenset({
     "get_user_addresses",
 })
 
+# Tools that END a flow — after a successful one, wipe order_params + active_intent
+# so the next turn starts clean and reclassifies fresh.
+# NOTE: get_active_orders is NOT here — it's a step toward cancel, not terminal.
+TERMINAL_TOOLS = {"place_order", "cancel_order", "get_order_status","discard_current_order"}
 
 def _merge_messages(left: list[dict], right: list[dict]) -> list[dict]:
     """Reducer: append new messages to existing history."""
@@ -104,6 +108,22 @@ class GraphState(TypedDict, total=False):
 
     # Set by retrieve_node when a named restaurant couldn't be matched
     restaurant_not_found: bool
+
+    # Set by retrieve_node when the requested item isn't available at the
+    # restaurant. run_turn() persists this into order_params so it survives
+    # the Valkey round-trip. collect_params_node clears items[] when it sees
+    # this flag, so stale items don't accumulate when the user picks a new one.
+    item_rejected: bool
+
+    # Set by llm_node when restaurant + items + payment are all confirmed.
+    # Frontend intercepts final_text "CHECKOUT_READY::{...}" prefix and
+    # navigates to the checkout screen. order_params is reset after this.
+    checkout_ready: bool
+
+    # Set by llm_node when user explicitly confirms the order summary.
+    # Persisted in order_params so it survives the Valkey round-trip.
+    # Triggers checkout handoff on the next turn.
+    items_confirmed: bool
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -155,6 +175,12 @@ async def retrieve_node(state: GraphState) -> dict[str, Any]:
       - Interpreting empty results as not-found and short-circuiting to END
       - Presenting restaurant choices when item is known but restaurant isn't
       - Passing confirmed chunks to LLM as RAG context
+
+    item_rejected flag:
+      Set to True when the requested item isn't available at the restaurant.
+      run_turn() persists this into order_params (Valkey) so collect_params_node
+      sees it next turn and clears stale items before merging the user's new pick.
+      Set to False on all other paths so the flag is always explicitly returned.
     """
     query = state["user_message"]
     order_params = state.get("order_params") or {}
@@ -212,7 +238,12 @@ async def retrieve_node(state: GraphState) -> dict[str, Any]:
                 f"on EasyCater. Would you like to search for something else?"
             )
             log.info("restaurant_not_found", extra={"restaurant_name": restaurant_name})
-            return {"rag_context": "", "final_text": msg, "restaurant_not_found": True}
+            return {
+                "rag_context": "",
+                "final_text": msg,
+                "restaurant_not_found": True,
+                "item_rejected": False,
+            }
 
         matched_restaurant_id   = restaurant_check[0].restaurant_id
         matched_restaurant_name = restaurant_check[0].restaurant_name
@@ -259,7 +290,12 @@ async def retrieve_node(state: GraphState) -> dict[str, Any]:
                     "restaurant_id": matched_restaurant_id,
                     "menu_item": menu_item,
                 })
-                return {"rag_context": "", "final_text": msg, "restaurant_not_found": False}
+                return {
+                    "rag_context": "",
+                    "final_text": msg,
+                    "restaurant_not_found": False,
+                    "item_rejected": True,   # ← tells collect_params to clear items next turn
+                }
 
     # ── Item known, no restaurant — find which restaurants serve it ───────────
     elif menu_item:
@@ -276,7 +312,12 @@ async def retrieve_node(state: GraphState) -> dict[str, Any]:
                 f"Would you like to try a different dish or browse what's available?"
             )
             log.info("item_not_found_anywhere", extra={"menu_item": menu_item})
-            return {"rag_context": "", "final_text": msg, "restaurant_not_found": False}
+            return {
+                "rag_context": "",
+                "final_text": msg,
+                "restaurant_not_found": False,
+                "item_rejected": True,   # ← user will pick a different item next turn
+            }
 
         # Deduplicate by restaurant — keep one entry per restaurant
         seen: set[str] = set()
@@ -303,7 +344,12 @@ async def retrieve_node(state: GraphState) -> dict[str, Any]:
             "menu_item": menu_item,
             "n_restaurants": len(unique_restaurants),
         })
-        return {"rag_context": "", "final_text": msg, "restaurant_not_found": False}
+        return {
+            "rag_context": "",
+            "final_text": msg,
+            "restaurant_not_found": False,
+            "item_rejected": False,   # item exists, just picking a restaurant
+        }
 
     # ── Pure discovery — no restaurant or item named ──────────────────────────
     else:
@@ -324,6 +370,7 @@ async def retrieve_node(state: GraphState) -> dict[str, Any]:
             "rag_context": "",
             "final_text": msg,
             "restaurant_not_found": False,
+            "item_rejected": True,
         }
 
     ctx = format_chunks_for_prompt(chunks)
@@ -337,6 +384,7 @@ async def retrieve_node(state: GraphState) -> dict[str, Any]:
         "rag_context": ctx,
         # "order_params": updated_params,
         "restaurant_not_found": False,
+        "item_rejected": False,
     }
 
 
@@ -346,82 +394,100 @@ async def llm_node(state: GraphState) -> dict[str, Any]:
     RAG context is injected into a LOCAL copy of messages for this call only —
     never written back to state["messages"].
 
-    When all order details are confirmed (restaurant, items, order_type, is_cod,
-    delivery_address for delivery orders), tool_choice is forced to place_order
-    so the model cannot respond conversationally instead of placing the order.
+    When restaurant and items are confirmed, short-circuits to END and emits
+    a CHECKOUT_READY signal instead of calling vLLM. The frontend intercepts
+    this and navigates to the checkout screen.
     """
     messages = list(state["messages"])
 
-    # Inject RAG context as a user-role message immediately before the last
-    # user turn. User-role injections mid-conversation are followed more
-    # reliably by Qwen than system-role injections at the same position.
-    # Operates on the local copy — state["messages"] is never mutated here.
     rag_ctx = state.get("rag_context", "")
     if rag_ctx:
         insert_idx = len(messages)  # default: append at end
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user":
-                insert_idx = i
+                messages.insert(i, {"role": "system", "content": f"[CONTEXT]\n{rag_ctx}\n[/CONTEXT]"})
                 break
         messages.insert(insert_idx, {
             "role": "system",
             "content": f"Current menu context for this order:\n{rag_ctx}"
         })
 
-    # ── Detect if all order details are confirmed → force place_order ─────────
-    order_params  = state.get("order_params") or {}
-    order_type    = order_params.get("order_type")
-    is_cod        = order_params.get("is_cod")
-    has_address   = bool(order_params.get("delivery_address"))
-    has_restaurant = bool(order_params.get("restaurant_name"))
-    has_items      = bool(order_params.get("items"))
-    has_order_type = order_type in ("delivery", "pickup", "dinein")
-    has_payment    = is_cod is not None
+    # ── Detect if all order details are confirmed → emit checkout signal ───────
+    # Two-stage gate:
+    #   Stage 1 (items_confirmed=False): LLM confirms quantity + special
+    #     instructions with the user. Once user says yes/confirmed, collect_params
+    #     sets items_confirmed=True in order_params.
+    #   Stage 2 (items_confirmed=True): short-circuit to checkout immediately.
+    order_params = state.get("order_params") or {}
+    items_confirmed = order_params.get("items_confirmed", False)
 
-    # log.info("llm_node_order_params_snapshot", extra={
-    #     "restaurant":       order_params.get("restaurant_name"),
-    #     "order_type":       order_params.get("order_type"),
-    #     "is_cod":           order_params.get("is_cod"),
-    #     "has_address":      bool(order_params.get("delivery_address")),
-    #     "has_saved_addrs":  bool(order_params.get("_saved_addresses")),
-    #     "items":            len(order_params.get("items") or []),
-    # })
-
-    # All details confirmed including address → force place_order
     all_confirmed = (
-        has_restaurant and has_items and has_order_type
-        and has_payment and has_address
+        bool(order_params.get("restaurant_name"))
+        and bool(order_params.get("items"))
+        and items_confirmed
     )
 
-    # Know it's delivery, have items+restaurant, but no address yet → force get_user_addresses
-    # Trigger even if is_cod is still unknown — LLM will ask payment after address
-    needs_address = (
-        has_restaurant and has_items
-        and order_type == "delivery"
-        and has_payment
-        and not has_address
-    )
+    # ── Inject order status block so LLM knows what's confirmed vs missing ────
+    order_status_lines = []
+    if order_params.get("restaurant_name") and order_params.get("items"):
+        items_list = order_params.get("items") or []
+        item_str = ", ".join(
+            f"{it['quantity']}x {it['name']}"
+            + (f" ({it['special_instructions']})" if it.get("special_instructions") else "")
+            for it in items_list
+        )
+        order_status_lines.append(
+            f"CURRENT ORDER (IN PROGRESS — NOT YET PLACED, no order_id): "
+            f"{item_str} from {order_params['restaurant_name']}"
+        )
 
+        if all_confirmed:
+            order_status_lines.append(
+                "STATUS: ✅ ALL CONFIRMED — tell the user you are taking them to checkout. Do NOT call any tool."
+            )
+        elif not items_confirmed:
+            order_status_lines.append(
+                "STATUS: ⏳ PENDING CONFIRMATION — confirm the exact items, quantities, "
+                "and any special instructions with the user in plain language. "
+                "Once the user says yes/confirmed, you MUST reply with the word CONFIRMED on its own line."
+            )
+
+        order_status = "\n".join(order_status_lines)
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                messages.insert(i, {"role": "system", "content": f"[ORDER STATUS]\n{order_status}\n[/ORDER STATUS]"})
+                break
+
+    # ── Short-circuit to checkout — skip LLM call entirely ───────────────────
     if all_confirmed:
-        tool_choice = {"type": "function", "function": {"name": "place_order"}}
-        log.info("llm_forcing_place_order", extra={
+        items_list = order_params.get("items") or []
+        item_str = ", ".join(
+            f"{it['quantity']}x {it['name']}" for it in items_list
+        )
+        checkout_text = (
+            f"Great! Taking you to checkout for {item_str} "
+            f"from {order_params['restaurant_name']}. "
+            f"You can choose delivery or pickup and confirm your address there."
+        )
+        checkout_payload = json.dumps({
+            "restaurant_id": None,
+            "items": items_list,
+        })
+        log.info("checkout_ready", extra={
             "restaurant": order_params.get("restaurant_name"),
-            "order_type": order_type,
-            "is_cod":     is_cod,
+            "items":      item_str,
         })
-    elif needs_address:
-        tool_choice = {"type": "function", "function": {"name": "get_user_addresses"}}
-        log.info("llm_forcing_get_user_addresses", extra={
-            "restaurant": order_params.get("restaurant_name"),
-        })
-    else:
-        tool_choice = "auto"
-        log.info("llm_auto_mode", extra={
-            "restaurant":  order_params.get("restaurant_name"),
-            "order_type":  order_type,
-            "is_cod":      is_cod,
-            "has_address": has_address,
-        })
+        return {
+            "messages":       [{"role": "assistant", "content": f"CHECKOUT_READY::{checkout_payload}"}],
+            "final_text":     checkout_text,
+            "checkout_ready": True,
+        }
+
+    tool_choice = "auto"
+    log.info("llm_auto_mode", extra={
+        "restaurant": order_params.get("restaurant_name"),
+        "missing":    order_status_lines[-1] if order_status_lines else "no order in progress",
+    })
 
     resp = await chat_complete(
         messages,
@@ -455,7 +521,34 @@ async def llm_node(state: GraphState) -> dict[str, Any]:
 
     update: dict[str, Any] = {"messages": [assistant_msg]}
     if not msg.tool_calls:
-        update["final_text"] = msg.content or ""
+        content = msg.content or ""
+
+        # Robust confirmation: the model sometimes appends CONFIRMED to other text
+        # or echoes a CHECKOUT_READY:: token it saw in history, so match the token
+        # anywhere — not just alone on a line.
+        if re.search(r"\bCONFIRMED\b", content):
+            op = state.get("order_params") or {}
+            items_list = op.get("items") or []
+            item_str = ", ".join(f"{it['quantity']}x {it['name']}" for it in items_list)
+            checkout_payload = json.dumps({
+                "restaurant_id": op.get("restaurant_id"),
+                "items": items_list,
+            })
+            # Drop any hallucinated CHECKOUT_READY:: sentinel (and everything after
+            # it) plus the CONFIRMED token, so neither reaches the user or history.
+            visible = content.split("CHECKOUT_READY::")[0]
+            visible = re.sub(r"\bCONFIRMED\b", "", visible).strip()
+            log.info("checkout_ready", extra={
+                "restaurant": op.get("restaurant_name"), "items": item_str,
+            })
+            return {
+                "messages":       [{"role": "assistant", "content": f"CHECKOUT_READY::{checkout_payload}"}],
+                "final_text":     visible or f"Taking you to checkout for {item_str}.",
+                "checkout_ready": True,
+            }
+
+        update["final_text"] = content
+
     return update
 
 
@@ -465,7 +558,6 @@ async def tools_node(state: GraphState) -> dict[str, Any]:
     tool_calls = last_msg.get("tool_calls", [])
     jwt_token = state.get("jwt_token", "")
 
-    # JWT presence check — confirms token flows end-to-end
     log.info("tools_node_jwt_check", extra={
         "jwt_present": bool(jwt_token),
         "jwt_prefix":  jwt_token[:20] if jwt_token else "EMPTY",
@@ -487,15 +579,12 @@ async def tools_node(state: GraphState) -> dict[str, Any]:
         else:
             args = dict(raw_args)
 
-        # Silently inject JWT for tools that require authentication
         if name in _AUTH_REQUIRED_TOOLS:
             args["jwt_token"] = jwt_token
 
         log.info("tool_invoke", extra={"tool": name, "tool_call_id": tc["id"]})
         result = await execute_tool(name, args)
 
-        # When LLM calls place_order, capture delivery_address it used
-        # so order_params stays in sync for the forced-tool-call detection
         if name == "place_order":
             try:
                 place_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
@@ -511,10 +600,6 @@ async def tools_node(state: GraphState) -> dict[str, Any]:
                     "success": addr_result.get("success"),
                     "count":   addr_result.get("total", 0),
                 })
-                # Cache addresses in order_params so next turn can resolve selection
-                if addr_result.get("success") and addr_result.get("addresses"):
-                    updated_order_params["_saved_addresses"] = addr_result["addresses"]
-
             except (json.JSONDecodeError, AttributeError):
                 pass
 
@@ -541,26 +626,18 @@ def route_intent(state: GraphState) -> str:
     intent = state.get("intent", "general")
     if intent == "order_food":
         return "collect_params"
-    # cancel_order, check_order_status, general all go to retrieve
-    return "retrieve"
+    if intent in ("cancel_order", "check_order_status"):
+        return "llm"          # get_active_orders / cancel_order / get_order_status handle it
+    return "retrieve"          # general / discovery only
 
 
 def route_after_collect_params(state: GraphState) -> str:
-    """After collect_params_node: go to retrieve (complete) or end turn (incomplete)."""
     if state.get("params_complete"):
         return "retrieve"
-    # Params incomplete — final_text already set with clarifying question.
-    # run_turn() will persist it to Valkey history after ainvoke() returns.
     return END
 
 
 def route_after_retrieve(state: GraphState) -> str:
-    """After retrieve_node: go to llm or short-circuit to END.
-
-    retrieve_node sets final_text + restaurant_not_found=True when the named
-    restaurant isn't in the catalogue, or sets final_text alone when the item
-    isn't available. Both cases skip the LLM entirely.
-    """
     if state.get("restaurant_not_found") or (
         state.get("final_text") and not state.get("rag_context")
     ):
@@ -568,11 +645,7 @@ def route_after_retrieve(state: GraphState) -> str:
     return "llm"
 
 
-
-# REPLACE should_continue():
-
 def should_continue(state: GraphState) -> str:
-    """After llm_node: loop to tools or end."""
     last_msg = state["messages"][-1]
     has_tool_calls = bool(last_msg.get("tool_calls"))
     iters = state.get("tool_iterations", 0)
@@ -617,6 +690,7 @@ def should_continue_after_tools(state: GraphState) -> str:
 
 # REPLACE build_graph() entirely:
 def build_graph():
+    log.info("graph_building", extra={"entry": "intent", "nodes": "full_pipeline"})
     g = StateGraph(GraphState)
 
     g.add_node("intent", intent_node)
@@ -630,19 +704,13 @@ def build_graph():
     g.add_conditional_edges(
         "intent",
         route_intent,
-        {
-            "collect_params": "collect_params",
-            "retrieve": "retrieve",
-        },
+        {"collect_params": "collect_params", "retrieve": "retrieve", "llm":"llm",}
     )
 
     g.add_conditional_edges(
         "collect_params",
         route_after_collect_params,
-        {
-            "retrieve": "retrieve",
-            END: END,
-        },
+        {"retrieve": "retrieve", END: END},
     )
 
     g.add_conditional_edges(
@@ -657,11 +725,7 @@ def build_graph():
         {"tools": "tools", END: END},
     )
 
-    g.add_conditional_edges(
-        "tools",
-        should_continue_after_tools,
-        {"llm": "llm", END: END},
-    )
+    g.add_edge("tools", "llm")
 
     return g.compile()
 
@@ -724,18 +788,40 @@ async def run_turn(
     order_params: Optional[dict[str, Any]] = None,
     jwt_token: str = "",
 ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+    """Run a single conversational turn.
+
+    Returns:
+        (final_assistant_text, updated_history, updated_order_params)
+
+    History write rules
+    ───────────────────
+    • Normal LLM turns: assistant + tool messages appended (system stripped).
+    • collect_params incomplete: clarifying question appended manually.
+    • retrieve short-circuit: not-found message appended manually.
+    • RAG injections: never written to state["messages"].
+
+    item_rejected persistence
+    ─────────────────────────
+    When retrieve_node sets item_rejected=True, run_turn writes it into
+    updated_order_params so it survives the Valkey round-trip. On the next
+    turn collect_params_node reads it from order_params, clears items[], and
+    pops the flag before merging the user's new item selection.
+    """
     graph = get_graph()
     initial_messages = build_initial_messages(history, user_message)
 
     final_state = await graph.ainvoke(
         {
-            "session_id": session_id,
-            "user_message": user_message,
-            "messages": initial_messages,
-            "tool_iterations": 0,
-            "order_params": order_params or {},
-            "params_complete": False,
-            "jwt_token": jwt_token,
+            "session_id":           session_id,
+            "user_message":         user_message,
+            "messages":             initial_messages,
+            "tool_iterations":      0,
+            "order_params":         order_params or {},
+            "params_complete":      False,
+            "jwt_token":            jwt_token,
+            "restaurant_not_found": False,
+            "item_rejected":        False,
+            "checkout_ready":       False,
         }
     )
 
@@ -744,48 +830,16 @@ async def run_turn(
     # ── Rebuild Valkey history ────────────────────────────────────────────────
     new_messages: list[dict[str, Any]] = []
     for m in final_state["messages"]:
+        # Strip system messages — includes the system prompt, ephemeral RAG
+        # context injections, and ORDER STATUS blocks, all of which are
+        # role="system" and must never persist to Valkey.
         if m.get("role") == "system":
             continue
         new_messages.append(m)
 
-    # ── Build final_text from get_user_addresses result if LLM didn't set it ──
-    # This fires when should_continue_after_tools returned END after the tool ran,
-    # so the LLM never produced a text response.
-    addr_tool_msg = None
-    for m in new_messages:
-        if m.get("role") == "tool" and m.get("name") == "get_user_addresses":
-            addr_tool_msg = m
-            break
-
-    if addr_tool_msg and not final_text:
-        try:
-            addr_data = json.loads(addr_tool_msg.get("content", "{}"))
-            addresses = addr_data.get("addresses", [])
-            if addresses:
-                lines = ["Here are your saved addresses:"]
-                for i, addr in enumerate(addresses, 1):
-                    label = addr.get("label") or f"Address {i}"
-                    full  = addr.get("full_address", "")
-                    city  = addr.get("city", "")
-                    lines.append(f"{i}. {label} — {full}, {city}")
-                lines.append("\nWhich address would you like to deliver to?")
-                final_text = "\n".join(lines)
-            else:
-                final_text = "You don't have any saved addresses. Could you provide your delivery address?"
-        except (json.JSONDecodeError, AttributeError):
-            pass
-
-    if not final_text:
-        final_text = "Sorry, I had trouble completing that. Could you rephrase?"
-
-    # ── Append assistant message to history when LLM didn't produce one ───────
     intent = final_state.get("intent", "general")
     params_complete_flag = final_state.get("params_complete", False)
     tool_ran = any(m.get("role") == "tool" for m in new_messages)
-    last_msg_is_assistant = (
-        new_messages and new_messages[-1].get("role") == "assistant"
-    )
-
     retrieve_short_circuited = bool(
         final_state.get("restaurant_not_found")
         or (
@@ -797,27 +851,45 @@ async def run_turn(
         )
     )
 
-    # collect_params ended the turn — append clarifying question
     if intent == "order_food" and not params_complete_flag and not tool_ran and final_text:
         new_messages.append({"role": "assistant", "content": final_text})
-
-    # retrieve short-circuited — append not-found message
     elif retrieve_short_circuited and final_text:
         new_messages.append({"role": "assistant", "content": final_text})
 
-    # tools ended the turn (get_user_addresses or place_order) — append summary
-    elif tool_ran and not last_msg_is_assistant and final_text:
-        new_messages.append({"role": "assistant", "content": final_text})
-
-    # ── Reset order_params if order was successfully placed ───────────────────
+    # ── Reset order_params on checkout handoff or successful place_order ────────
     updated_order_params = final_state.get("order_params") or {}
-    for m in new_messages:
-        if m.get("role") == "tool" and m.get("name") == "place_order":
-            try:
-                result = json.loads(m.get("content", "{}"))
-                if result.get("success"):
-                    updated_order_params = {}
-            except (json.JSONDecodeError, AttributeError):
-                pass
+    # Checkout handoff — frontend takes over, clear order state
+    order_finished = bool(final_state.get("checkout_ready"))
+    
+    if final_state.get("checkout_ready"):
+        updated_order_params = {}
+        new_messages = []          # ← drop the finished order's history too
+        log.info("flow_reset", extra={"reason": "checkout_ready"})
 
+   
+    # ── Terminal tools — reset order_params (incl. active_intent) ─────────────
+    # A successful place_order / cancel_order / get_order_status ends the flow.
+    # Wiping order_params clears active_intent too, so the next turn starts
+    # clean and reclassifies fresh. A tool that explicitly reports success=False
+    # (e.g. a cancel that failed) does NOT reset, so the user stays in the flow
+    # to retry.
+    for m in new_messages:
+        if m.get("role") != "tool" or m.get("name") not in TERMINAL_TOOLS:
+            continue
+        try:
+            result = json.loads(m.get("content", "{}"))
+        except (json.JSONDecodeError, AttributeError):
+            result = {}
+        if result.get("success") is False:
+            continue
+        updated_order_params = {}
+        if m.get("name") in ("place_order", "cancel_order", "discard_current_order"):
+            order_finished = True
+
+    if order_finished:
+        updated_order_params = {}
+        new_messages = []
+        log.info("flow_reset", extra={"reason": "order_finished"})
+
+    updated_order_params["item_rejected"] = final_state.get("item_rejected", False)
     return final_text, new_messages, updated_order_params

@@ -144,8 +144,13 @@ def merge_order_params(existing: OrderParams, extracted: dict[str, Any]) -> Orde
 
 # ── Completion check ──────────────────────────────────────────────────────────
 
-# REPLACE params_complete:
 def params_complete(params: OrderParams) -> bool:
+    """Return True if we have enough to proceed to retrieve + LLM.
+
+    Only restaurant_name and items are required here. order_type, is_cod,
+    and delivery_address are collected by the LLM during the tool-calling
+    phase — not by collect_params.
+    """
     has_restaurant = bool(params.get("restaurant_name"))
     has_items = bool(params.get("items"))
     return has_restaurant and has_items
@@ -153,6 +158,7 @@ def params_complete(params: OrderParams) -> bool:
 
 # REPLACE missing_fields_message:
 def missing_fields_message(params: OrderParams) -> str:
+    """Generate a natural-language question for missing params."""
     missing = []
 
     if not params.get("restaurant_name"):

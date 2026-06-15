@@ -8,16 +8,35 @@ Usage:
 """
 
 import argparse
+import os
 import json
 import sys
 import urllib.request
 import urllib.error
 from datetime import datetime
+import urllib.request
+import uuid
+import tempfile
+import requests
+
+try:
+    import sounddevice as sd
+    import soundfile as sf
+    import numpy as np
+    AUDIO_LIBS_AVAILABLE = True
+except ImportError:
+    AUDIO_LIBS_AVAILABLE = False
+
+VOICE_MODE = False
+SAMPLE_RATE = 16000
+
+SESSION_ID = "14"
 
 BASE_URL   = "http://localhost:8000"
 RESET_URL  = BASE_URL + "/v1/session/{sid}/reset"
 CHAT_URL   = BASE_URL + "/v1/chat/sync"
 HEALTH_URL = BASE_URL + "/v1/health"
+VOICE_URL = BASE_URL + "/v1/chat/voice"
 
 # ── ANSI colors ───────────────────────────────────────────────────────────────
 R  = "\033[0m"
@@ -29,6 +48,10 @@ RD = "\033[91m"
 DM = "\033[2m"
 
 def c(color, text): return f"{color}{text}{R}"
+
+def log(tag, msg, color=DM):
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(c(color, f"  [{ts}] {tag}: {msg}"))
 
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -65,6 +88,78 @@ def chat(session_id, message, jwt_token=""):
     if err:
         return None, err
     return result.get("text", ""), None
+
+
+def record_to_wav():
+    """
+    Push-to-talk recording: press Enter to start, press Enter again to stop.
+    Saves 16kHz mono 16-bit audio to a temp .wav file.
+    Returns (path, duration_seconds), or (None, 0.0) if nothing was captured.
+    """
+    if not AUDIO_LIBS_AVAILABLE:
+        print(c(RD, "  ✗ sounddevice/soundfile not installed."))
+        print(c(YL, "  Run: brew install portaudio && pip install sounddevice soundfile numpy"))
+        return None, 0.0
+
+    frames = []
+
+    def callback(indata, frame_count, time_info, status):
+        if status:
+            log("AUDIO", str(status), RD)
+        frames.append(indata.copy())
+
+    input(c(GR, "  Press Enter to START recording..."))
+    log("REC", "started", YL)
+
+    stream = sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=1,
+        dtype="int16",
+        callback=callback,
+    )
+    stream.start()
+    input(c(GR, "  Recording... press Enter to STOP"))
+    stream.stop()
+    stream.close()
+
+    if not frames:
+        log("REC", "no audio captured", RD)
+        return None, 0.0
+
+    audio = np.concatenate(frames, axis=0)
+    duration = len(audio) / SAMPLE_RATE
+
+    temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    sf.write(temp_file.name, audio, SAMPLE_RATE)
+    log("REC", f"stopped — {duration:.2f}s, saved to {temp_file.name}", GR)
+
+    return temp_file.name, duration
+
+
+def voice_chat(session_id, audio_path, jwt_token=""):
+    log("SEND", f"POST {VOICE_URL} (session={session_id})")
+    t0 = datetime.now()
+    try:
+        with open(audio_path, "rb") as audio:
+            response = requests.post(
+                VOICE_URL,
+                files={
+                    "audio": audio
+                },
+                data={
+                    "session_id": session_id,
+                    "jwt_token": jwt_token,
+                },
+                timeout=300
+            )
+        elapsed = (datetime.now() - t0).total_seconds()
+        response.raise_for_status()
+        log("RECV", f"{elapsed:.2f}s — HTTP {response.status_code}", GR)
+        return response.json(), elapsed, None
+    except requests.exceptions.RequestException as e:
+        elapsed = (datetime.now() - t0).total_seconds()
+        log("ERROR", f"{elapsed:.2f}s — {e}", RD)
+        return None, elapsed, str(e)
 
 
 def reset_session(session_id):
@@ -246,6 +341,7 @@ def interactive(session_id, jwt_token=""):
     print(f"  Session : {c(CY, session_id)}")
     print(f"  Commands: {c(DM, ', '.join(COMMANDS.keys()))}")
     print(c(B, '═' * 58) + "\n")
+    print(c(DM, f"  JWT token (first 30 chars): {jwt_token[:30]}"))
 
     while True:
         try:
@@ -323,6 +419,54 @@ def main():
     print(c(DM, "  Checking server health..."))
     check_health()
     print()
+
+    if VOICE_MODE:
+        print(f"\n{c(B, '═' * 58)}")
+        print(c(B, "  AKI VOICE TEST — full flow (STT + agent)"))
+        print(c(B, '═' * 58))
+        print(f"  Session : {c(CY, SESSION_ID)}")
+        print(c(DM, "  Commands: /reset, /quit  (otherwise Enter to record)\n"))
+
+        while True:
+            cmd = input(c(GR, "  Press Enter to talk, or type a command: ")).strip()
+
+            if cmd == "/quit":
+                print("Bye!")
+                break
+
+            if cmd == "/reset":
+                if reset_session(SESSION_ID):
+                    print(c(YL, f"  ✓ Session {SESSION_ID} reset.\n"))
+                else:
+                    print(c(RD, "  ✗ Reset failed.\n"))
+                continue
+
+            if cmd:
+                log("WARN", f"unknown command '{cmd}', ignoring", YL)
+                continue
+
+            # ── Record ───────────────────────────────────────
+            audio_path, duration = record_to_wav()
+            if audio_path is None:
+                continue
+
+            # ── Send to Aki (STT + agent pipeline) ─────────────
+            result, elapsed, err = voice_chat(SESSION_ID, audio_path, jwt_token)
+
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
+
+            if err:
+                print(c(RD, f"  ✗ Error: {err}\n"))
+                continue
+
+            text = result.get("text", "")
+            log("AKI", f"reply ({elapsed:.2f}s)", CY)
+            print(f"  {c(CY, B + 'Aki:')} {text}\n")
+
+        return
 
     if args.suite:
         ok = run_suite(args.session, jwt_token)

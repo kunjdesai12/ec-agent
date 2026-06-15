@@ -7,7 +7,10 @@ from typing import Any
 
 from agent.app.llm import chat_complete
 from agent.app.logging_setup import get_logger
-from agent.app.state.order_state import ( OrderParams, merge_order_params, params_complete, missing_fields_message, should_clear_items)
+from agent.app.state.order_state import (
+    OrderParams, merge_order_params, params_complete,
+    missing_fields_message, should_clear_items,
+)
 
 log = get_logger(__name__)
 
@@ -59,84 +62,76 @@ def _should_reclassify(user_message: str, current_intent: str) -> bool:
     """
     lower = user_message.lower()
 
-    # Always reclassify on explicit reset phrases
     if any(phrase in lower for phrase in _ALWAYS_RECLASSIFY):
         return True
 
-    # Check if user is explicitly switching away from current intent
     switch_signals = _SWITCH_SIGNALS.get(current_intent, [])
     if any(signal in lower for signal in switch_signals):
         return True
 
-    # Otherwise keep the sticky intent
     return False
 
 
 async def intent_node(state: dict[str, Any]) -> dict[str, Any]:
     """
-    Classify user message intent with sticky intent support.
-
-    If an intent is already active (stored in order_params),
-    reuse it unless the user explicitly signals a switch.
-    This prevents mid-order messages like "yes", "2 please",
-    "14 Alkapuri" from being misclassified as 'general'.
-
-    NOTE: This node never writes to state["messages"]. Intent classification
-    is internal routing only and must not appear in LLM conversation history.
+    Classify intent with sticky support. Sticky is a FALLBACK, not an override:
+    we always classify, and only fall back to the active intent when the fresh
+    result is ambiguous ('general'). This keeps mid-flow filler ("yes", "2 please",
+    "14 Alkapuri") in the active flow while still allowing a clear new request
+    ("get me biryani from honest") to switch intents.
     """
     user_message = state["user_message"]
     order_params: OrderParams = state.get("order_params") or {}
+    active_intent = order_params.get("active_intent")
 
-    # ── Sticky intent check ───────────────────────────────────────────────────
-    current_intent = order_params.get("active_intent")
-
-    if current_intent and not _should_reclassify(user_message, current_intent):
-        log.info(
-            "intent_sticky",
-            extra={"intent": current_intent, "user_msg": user_message[:80]},
-        )
-        return {"intent": current_intent}
-
-    # ── Fresh classification ──────────────────────────────────────────────────
+    # ── Always classify fresh ─────────────────────────────────────────────
     resp = await chat_complete(
         [
             {"role": "system", "content": _INTENT_SYSTEM},
             {"role": "user", "content": user_message},
         ],
-        tools=None,
-        tool_choice=None,
-        stream=False,
+        tools=None, tool_choice=None, stream=False,
     )
-
     raw = (resp.choices[0].message.content or "").strip()
     try:
         data = json.loads(raw)
-        intent = data.get("intent", "general")
+        fresh = data.get("intent", "general")
     except (json.JSONDecodeError, AttributeError):
         lower = user_message.lower()
         if any(w in lower for w in ["order", "want", "buy", "get me", "parcel"]):
-            intent = "order_food"
+            fresh = "order_food"
         elif any(w in lower for w in ["status", "track", "where is", "my order"]):
-            intent = "check_order_status"
+            fresh = "check_order_status"
         elif any(w in lower for w in ["cancel", "cancellation", "stop order"]):
-            intent = "cancel_order"
+            fresh = "cancel_order"
         else:
-            intent = "general"
+            fresh = "general"
 
-    log.info(
-        "intent_classified",
-        extra={"intent": intent, "user_msg": user_message[:80]},
-    )
-
-    # ── Store active intent in order_params so it persists across turns ───────
-    # Only set/update when intent is actionable (not general/cancel)
-    if intent in ("order_food", "check_order_status", "cancel_order"):
+    # ── Sticky as fallback, not override ──────────────────────────────────
+    ACTIONABLE = ("order_food", "check_order_status", "cancel_order")
+    if fresh in ACTIONABLE:
+        intent = fresh                              # clear intent → honor / switch
+        if active_intent and fresh != active_intent:
+            log.info("intent_switched", extra={
+                "from": active_intent, "to": fresh, "user_msg": user_message[:80]})
+            # Intent changed → abandon the previous flow's order scratch so a
+            # new order doesn't inherit stale restaurant/items.
+            order_params = {"active_intent": fresh}
+        else:
+            order_params["active_intent"] = fresh
+            log.info("intent_classified", extra={
+                "intent": intent, "user_msg": user_message[:80]})
         order_params["active_intent"] = intent
+    elif active_intent:
+        intent = active_intent                      # ambiguous → stay in flow
+        log.info("intent_sticky", extra={
+            "intent": intent, "user_msg": user_message[:80]})
+    else:
+        intent = fresh                              # general, no active flow
+        log.info("intent_classified", extra={
+            "intent": intent, "user_msg": user_message[:80]})
 
-    return {
-        "intent": intent,
-        "order_params": order_params,
-    }
+    return {"intent": intent, "order_params": order_params}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -207,75 +202,6 @@ async def _extract_params(user_message: str, history: list[dict]) -> dict[str, A
         return {"restaurant_name": None, "items": [], "order_type": None, "is_cod": None}
 
 
-def _resolve_address_selection(
-    user_message: str, saved_addresses: list[dict]
-) -> dict | None:
-    import re
-    lower = user_message.lower().strip()
-
-    # Numeric selection — "1", "2", etc.
-    num_match = re.search(r'\b([1-9])\b', lower)
-    if num_match:
-        idx = int(num_match.group(1)) - 1
-        if 0 <= idx < len(saved_addresses):
-            return _format_address_for_order(saved_addresses[idx])
-
-    # Ordinal words
-    ordinals = {
-        "first": 0, "1st": 0,
-        "second": 1, "2nd": 1,
-        "third": 2, "3rd": 2,
-    }
-    for word, idx in ordinals.items():
-        if word in lower and idx < len(saved_addresses):
-            return _format_address_for_order(saved_addresses[idx])
-
-    # Label match — check if any address label appears in the user message
-    # Also handle common aliases
-    label_aliases = {
-        "office": "work",
-        "my home": "home",
-        "house": "home",
-        "at home": "home",
-        "home address": "home",
-        "work address": "work",
-    }
-    # Apply aliases first
-    normalized = lower
-    for alias, replacement in label_aliases.items():
-        if alias in normalized:
-            normalized = normalized.replace(alias, replacement)
-
-    for addr in saved_addresses:
-        label = (addr.get("label") or "").lower()
-        # Check if the label appears anywhere in the (normalized) user message
-        if label and label in normalized:
-            return _format_address_for_order(addr)
-
-    # If only one address exists and user said yes/ok/that one/confirm
-    confirm_signals = ["yes", "ok", "okay", "that one", "this one", "confirm", "sure", "yep", "yeah"]
-    if len(saved_addresses) == 1 and any(s in lower for s in confirm_signals):
-        return _format_address_for_order(saved_addresses[0])
-
-    return None
-
-
-def _format_address_for_order(addr: dict) -> dict:
-    """Convert a saved address dict into the shape place_order expects."""
-    return {
-        "address_line_1": addr.get("full_address") or addr.get("address_line_1", ""),
-        "address_line_2": addr.get("house_number") or addr.get("floor_no") or "",
-        "landmark":       addr.get("landmark") or "",
-        "city":           addr.get("city", ""),
-        "state":          addr.get("state", ""),
-        "pincode":        str(addr.get("pincode", "")),
-        "latitude":       float(addr.get("latitude") or 0),
-        "longitude":      float(addr.get("longitude") or 0),
-        # preserve label for logging
-        "label":          addr.get("label", ""),
-    }
-
-
 async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
     """Extract and accumulate order parameters.
 
@@ -284,48 +210,66 @@ async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
     when all details are confirmed and force the place_order tool call.
 
     NOTE: This node never writes to state["messages"].
+
+    Item rejection flow:
+    - When retrieve_node finds the requested item isn't available, it sets
+      item_rejected=True in GraphState. run_turn() persists this into
+      order_params so it survives the Valkey round-trip.
+    - On the next turn, we detect item_rejected in order_params and clear
+      the stale items[] before merging the user's new item selection.
+      This ensures "biryani" doesn't persist when the user switches to "dosa".
+    - The flag is consumed (popped) immediately so it only fires once.
     """
     user_message = state["user_message"]
     history = state.get("messages", [])
+    existing: OrderParams = state.get("order_params") or {}
+    suppress_history = False
+    # ── Clear stale items if previous turn rejected the requested item ────────
+    # item_rejected is stored in order_params by run_turn() so it survives
+    # the Valkey round-trip. Takes priority over should_clear_items() since
+    # the user may simply say "dosa" without any explicit "instead of" signal.
+    item_rejected = state.get("item_rejected") or existing.get("item_rejected", False)
+    if item_rejected:
+        existing = dict(existing)
+        existing["items"] = []
+        existing["restaurant_name"] = None   # the restaurant couldn't fulfill the
+                                             # request — don't pin the next item to
+                                             # it; let the search broaden across
+                                             # restaurants.
+        existing.pop("item_rejected", None)
+        suppress_history = True              # don't let the extractor re-pull the
+                                             # rejected item from history
+        log.info("items_cleared_after_rejection", extra={
+            "restaurant": existing.get("restaurant_name"),
+        })
 
+    # ── Clear stale items if user explicitly signals a change ─────────────────
+    # Handles phrases like "instead of", "change my order", "swap" etc.
+    # Only runs if item_rejected didn't already clear items above.
+    elif should_clear_items(user_message):
+        existing = dict(existing)
+        existing["items"] = []
+        suppress_history = True
+        log.info("items_cleared", extra={
+            "msg": user_message[:80],
+        })
+
+    # ── Strip duplicate user message from history tail ────────────────────────
+    # build_initial_messages already appended the current user_message to
+    # state["messages"]. _extract_params also appends it explicitly, so
+    # remove it from the tail of clean_history to avoid sending it twice.
     clean_history = [
         m for m in history
         if m.get("role") in ("user", "assistant") and not m.get("tool_calls")
     ]
-
-        # The current user_message is already in clean_history (added by
-    # build_initial_messages). Strip it from the tail before passing to
-    # _extract_params, which appends it explicitly.
     if clean_history and clean_history[-1].get("content") == user_message:
         clean_history = clean_history[:-1]
-
-    extracted = await _extract_params(user_message, clean_history)
-
-    existing: OrderParams = state.get("order_params") or {}
-
-    # ── Clear stale items if user is changing their selection ─────────────────
-    if should_clear_items(user_message):
-        existing = dict(existing)
-        existing["items"] = []
-        log.info("items_cleared", extra={
-            "reason": "change_signal_detected",
-            "msg": user_message[:80],
-        })
-
+    
+    history_for_extract = [] if suppress_history else clean_history
+    extracted = await _extract_params(user_message, history_for_extract)
     merged = merge_order_params(existing, extracted)
 
-    saved_addresses = merged.get("_saved_addresses", [])
-    if saved_addresses and not merged.get("delivery_address"):
-        resolved = _resolve_address_selection(user_message, saved_addresses)
-        if resolved:
-            merged["delivery_address"] = resolved
-            log.info("delivery_address_resolved", extra={
-                "label": resolved.get("label"),
-                "city":  resolved.get("city"),
-            })
-
     # ── Persist order_type and is_cod from extraction into order_params ───────
-    # These are not handled by merge_order_params since they're new fields.
     # Only overwrite if the extractor found a value (don't clear existing).
     if extracted.get("order_type") is not None:
         merged["order_type"] = extracted["order_type"]
@@ -336,8 +280,8 @@ async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
         "params_collected",
         extra={
             "restaurant": merged.get("restaurant_name"),
-            "item_count": len(merged.get("items", [])),
-            "order_type":  merged.get("order_type"),
+            "items": merged.get("items"),
+            "order_type": merged.get("order_type"),
             "is_cod": merged.get("is_cod"),
         },
     )
@@ -346,7 +290,7 @@ async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
         return {
             "order_params": merged,
             "params_complete": True,
-            # No messages written — graph continues to semantic_match → llm
+            # No messages written — graph continues to retrieve → llm
         }
     else:
         ask_text = missing_fields_message(merged)
@@ -355,4 +299,5 @@ async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
             "order_params": merged,
             "params_complete": False,
             "final_text": ask_text,
+            # No messages written — run_turn() appends this to Valkey history
         }

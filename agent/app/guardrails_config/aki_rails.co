@@ -1,22 +1,3 @@
-import guardrails
-import nemoguardrails.library
-
-flow main
-    activate input rails
-    activate output rails
-
-flow input rails $input_text
-    check jailbreak attempt
-    check off topic input
-    check competitor mention
-    check abusive language
-    check order manipulation
-
-flow output rails $output_text
-    check response on topic
-    check no competitor mention in response
-    self check output
-
 define user greet
   "hi"
   "hello"
