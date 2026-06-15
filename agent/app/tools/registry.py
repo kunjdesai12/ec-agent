@@ -152,24 +152,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "enum": ["delivery", "pickup", "dinein"],
                         "description": "Type of order being placed."
                     },
-                    # "customer_details": {
-                    #     "type": "object",
-                    #     "properties": {
-                    #         "name": {
-                    #             "type": "string",
-                    #             "description": "Customer full name."
-                    #         },
-                    #         "email": {
-                    #             "type": "string",
-                    #             "description": "Customer email address."
-                    #         },
-                    #         "phone": {
-                    #             "type": "string",
-                    #             "description": "Customer contact number."
-                    #         }
-                    #     },
-                    #     "required": ["name", "email", "phone"]
-                    # },
                     "delivery_address": {
                         "type": "object",
                         "properties": {
@@ -229,10 +211,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "type": "string",
                         "description": "Special cooking or delivery instructions."
                     },
-                    # "jwt_token": {
-                    #     "type": "string",
-                    #     "description": "JWT access token for authenticated API requests."
-                    # }
                 },
                 "required": [
                     "restaurant_id",
@@ -259,10 +237,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "type": "integer",
                         "description": "Unique order ID"
                     },
-                    # "jwt_token": {
-                    #     "type": "string",
-                    #     "description": "JWT bearer token for authenticated user"
-                    # }
                 },
                 "required": ["order_id"]
             }
@@ -279,16 +253,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "items, total amount and scheduled time. "
                 "If multiple orders exist, show them to user and ask which one to cancel."
             ),
-            # "parameters": {
-            #     "type": "object",
-            #     "properties": {
-            #         "jwt_token": {
-            #             "type": "string",
-            #             "description": "JWT bearer token for the authenticated user."
-            #         }
-            #     },
-            #     "required": ["jwt_token"]
-            # }
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -310,7 +274,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "  - Refund is triggered automatically via Razorpay. "
                 "If cancellation is not allowed, backend returns a clear error — "
                 "pass it directly to the user. "
-                "Always call get_active_orders first if you don't have the order_id."
+                "Always call get_active_orders first if you don't have the order_id. "
+                "Use this ONLY for orders already PLACED (which have an order_id). "
+                "To cancel an order the user is still building (the scratchpad / "
+                "CURRENT ORDER), use discard_current_order instead."
             ),
             "parameters": {
                 "type": "object",
@@ -323,14 +290,23 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "type": "string",
                         "description": "Reason for cancellation. Ask the user if not provided."
                     },
-                    # "jwt_token": {
-                    #     "type": "string",
-                    #     "description": "JWT bearer token for the authenticated user."
-                    # }
                 },
                 "required": ["order_id", "reason"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "discard_current_order",
+            "description": (
+            "Discard the in-progress order the user is currently building (the "
+            "scratchpad shown in CURRENT ORDER). Use this — NOT cancel_order — when "
+            "the user wants to cancel/clear the order they haven't placed yet. This "
+            "order has no order_id and does not exist in the backend."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
     },
     {
         "type": "function",
@@ -797,7 +773,14 @@ async def _cancel_order(args: dict[str, Any]) -> dict[str, Any]:
     jwt_token = args.get("jwt_token", "")
 
     if not order_id:
-        return {"success": False, "error": "order_id is required."}
+        return {
+            "success": False,
+            "error": (
+                "order_id is required — call get_active_orders first to find the "
+                "order_id. If the user means an order they haven't placed yet, "
+                "use discard_current_order instead."
+            ),
+        }
     if not reason:
         return {"success": False, "error": "reason is required. Please ask the user why they want to cancel."}
     if not jwt_token:
@@ -842,6 +825,22 @@ async def _cancel_order(args: dict[str, Any]) -> dict[str, Any]:
 
     except Exception as e:
         return {"success": False, "cancelled": False, "error": f"Something went wrong: {str(e)}"}
+
+
+async def _discard_current_order(args: dict[str, Any]) -> dict[str, Any]:
+    """Discard the in-progress (scratchpad) order.
+
+    This is purely a LOCAL state operation — no backend call. The actual
+    clearing of order_params happens in run_turn() via the TERMINAL_TOOLS
+    reset when this tool returns success. This handler just acknowledges so
+    the model gets a clean success it can confirm to the user.
+    """
+    return {
+        "success":   True,
+        "discarded": True,
+        "message":   "Your in-progress order has been cleared.",
+    }
+
 
 async def _get_user_addresses(args: dict[str, Any]) -> dict[str, Any]:
     """Fetch user's saved delivery addresses.
@@ -916,6 +915,7 @@ HANDLERS: dict[str, ToolHandler] = {
     "get_order_status": _get_order_status,
     "get_active_orders": _get_active_orders,
     "cancel_order": _cancel_order,
+    "discard_current_order": _discard_current_order,
     "get_user_addresses": _get_user_addresses,
 }
 

@@ -74,68 +74,64 @@ def _should_reclassify(user_message: str, current_intent: str) -> bool:
 
 async def intent_node(state: dict[str, Any]) -> dict[str, Any]:
     """
-    Classify user message intent with sticky intent support.
-
-    If an intent is already active (stored in order_params),
-    reuse it unless the user explicitly signals a switch.
-    This prevents mid-order messages like "yes", "2 please",
-    "14 Alkapuri" from being misclassified as 'general'.
-
-    NOTE: This node never writes to state["messages"]. Intent classification
-    is internal routing only and must not appear in LLM conversation history.
+    Classify intent with sticky support. Sticky is a FALLBACK, not an override:
+    we always classify, and only fall back to the active intent when the fresh
+    result is ambiguous ('general'). This keeps mid-flow filler ("yes", "2 please",
+    "14 Alkapuri") in the active flow while still allowing a clear new request
+    ("get me biryani from honest") to switch intents.
     """
     user_message = state["user_message"]
     order_params: OrderParams = state.get("order_params") or {}
+    active_intent = order_params.get("active_intent")
 
-    # ── Sticky intent check ───────────────────────────────────────────────────
-    current_intent = order_params.get("active_intent")
-
-    if current_intent and not _should_reclassify(user_message, current_intent):
-        log.info(
-            "intent_sticky",
-            extra={"intent": current_intent, "user_msg": user_message[:80]},
-        )
-        return {"intent": current_intent}
-
-    # ── Fresh classification ──────────────────────────────────────────────────
+    # ── Always classify fresh ─────────────────────────────────────────────
     resp = await chat_complete(
         [
             {"role": "system", "content": _INTENT_SYSTEM},
             {"role": "user", "content": user_message},
         ],
-        tools=None,
-        tool_choice=None,
-        stream=False,
+        tools=None, tool_choice=None, stream=False,
     )
-
     raw = (resp.choices[0].message.content or "").strip()
     try:
         data = json.loads(raw)
-        intent = data.get("intent", "general")
+        fresh = data.get("intent", "general")
     except (json.JSONDecodeError, AttributeError):
         lower = user_message.lower()
         if any(w in lower for w in ["order", "want", "buy", "get me", "parcel"]):
-            intent = "order_food"
+            fresh = "order_food"
         elif any(w in lower for w in ["status", "track", "where is", "my order"]):
-            intent = "check_order_status"
+            fresh = "check_order_status"
         elif any(w in lower for w in ["cancel", "cancellation", "stop order"]):
-            intent = "cancel_order"
+            fresh = "cancel_order"
         else:
-            intent = "general"
+            fresh = "general"
 
-    log.info(
-        "intent_classified",
-        extra={"intent": intent, "user_msg": user_message[:80]},
-    )
-
-    # ── Store active intent in order_params so it persists across turns ───────
-    if intent in ("order_food", "check_order_status", "cancel_order"):
+    # ── Sticky as fallback, not override ──────────────────────────────────
+    ACTIONABLE = ("order_food", "check_order_status", "cancel_order")
+    if fresh in ACTIONABLE:
+        intent = fresh                              # clear intent → honor / switch
+        if active_intent and fresh != active_intent:
+            log.info("intent_switched", extra={
+                "from": active_intent, "to": fresh, "user_msg": user_message[:80]})
+            # Intent changed → abandon the previous flow's order scratch so a
+            # new order doesn't inherit stale restaurant/items.
+            order_params = {"active_intent": fresh}
+        else:
+            order_params["active_intent"] = fresh
+            log.info("intent_classified", extra={
+                "intent": intent, "user_msg": user_message[:80]})
         order_params["active_intent"] = intent
+    elif active_intent:
+        intent = active_intent                      # ambiguous → stay in flow
+        log.info("intent_sticky", extra={
+            "intent": intent, "user_msg": user_message[:80]})
+    else:
+        intent = fresh                              # general, no active flow
+        log.info("intent_classified", extra={
+            "intent": intent, "user_msg": user_message[:80]})
 
-    return {
-        "intent": intent,
-        "order_params": order_params,
-    }
+    return {"intent": intent, "order_params": order_params}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -277,7 +273,7 @@ async def collect_params_node(state: dict[str, Any]) -> dict[str, Any]:
         "params_collected",
         extra={
             "restaurant": merged.get("restaurant_name"),
-            "item_count": len(merged.get("items", [])),
+            "items": merged.get("items"),
             "order_type": merged.get("order_type"),
             "is_cod": merged.get("is_cod"),
         },

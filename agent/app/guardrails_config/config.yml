@@ -17,4 +17,21 @@ embeddings:
   - model: BAAI/bge-m3
     engine: SentenceTransformers
 
-colang_version: "2.x"
+rails:
+  input:
+    flows:
+      - check jailbreak attempt
+      - check off topic input
+      - check competitor mention
+      - check abusive language
+      - check order manipulation
+  dialog:
+    user_messages:
+      embeddings_only: true
+      embeddings_only_similarity_threshold: 0.75
+      embeddings_only_fallback_intent: general
+  output:
+    flows:
+      - check response on topic
+      - check no competitor mention in response
+      - self check output

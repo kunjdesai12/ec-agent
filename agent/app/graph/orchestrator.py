@@ -75,6 +75,10 @@ _AUTH_REQUIRED_TOOLS = frozenset({
     "get_user_addresses",
 })
 
+# Tools that END a flow — after a successful one, wipe order_params + active_intent
+# so the next turn starts clean and reclassifies fresh.
+# NOTE: get_active_orders is NOT here — it's a step toward cancel, not terminal.
+TERMINAL_TOOLS = {"place_order", "cancel_order", "get_order_status","discard_current_order"}
 
 def _merge_messages(left: list[dict], right: list[dict]) -> list[dict]:
     """Reducer: append new messages to existing history."""
@@ -414,7 +418,10 @@ async def llm_node(state: GraphState) -> dict[str, Any]:
             + (f" ({it['special_instructions']})" if it.get("special_instructions") else "")
             for it in items_list
         )
-        order_status_lines.append(f"CURRENT ORDER: {item_str} from {order_params['restaurant_name']}")
+        order_status_lines.append(
+            f"CURRENT ORDER (IN PROGRESS — NOT YET PLACED, no order_id): "
+            f"{item_str} from {order_params['restaurant_name']}"
+        )
 
         if all_confirmed:
             order_status_lines.append(
@@ -590,7 +597,9 @@ def route_intent(state: GraphState) -> str:
     intent = state.get("intent", "general")
     if intent == "order_food":
         return "collect_params"
-    return "retrieve"
+    if intent in ("cancel_order", "check_order_status"):
+        return "llm"          # get_active_orders / cancel_order / get_order_status handle it
+    return "retrieve"          # general / discovery only
 
 
 def route_after_collect_params(state: GraphState) -> str:
@@ -640,7 +649,7 @@ def build_graph():
     g.add_conditional_edges(
         "intent",
         route_intent,
-        {"collect_params": "collect_params", "retrieve": "retrieve"},
+        {"collect_params": "collect_params", "retrieve": "retrieve", "llm":"llm",}
     )
 
     g.add_conditional_edges(
@@ -775,15 +784,25 @@ async def run_turn(
         updated_order_params = {}
         log.info("order_params_reset", extra={"reason": "checkout_ready"})
 
-    # Legacy place_order path (kept for safety)
+   
+    # ── Terminal tools — reset order_params (incl. active_intent) ─────────────
+    # A successful place_order / cancel_order / get_order_status ends the flow.
+    # Wiping order_params clears active_intent too, so the next turn starts
+    # clean and reclassifies fresh. A tool that explicitly reports success=False
+    # (e.g. a cancel that failed) does NOT reset, so the user stays in the flow
+    # to retry.
     for m in new_messages:
-        if m.get("role") == "tool" and m.get("name") == "place_order":
+        if m.get("role") == "tool" and m.get("name") in TERMINAL_TOOLS:
             try:
                 result = json.loads(m.get("content", "{}"))
-                if result.get("success"):
-                    updated_order_params = {}
             except (json.JSONDecodeError, AttributeError):
-                pass
+                result = {}
+            if result.get("success") is not False:
+                updated_order_params = {}
+                log.info("order_params_reset", extra={
+                    "reason": f"terminal_tool:{m.get('name')}",
+                })
+                break
 
     # ── Persist item_rejected into order_params for next turn ─────────────────
     # collect_params_node reads this from order_params (not GraphState) because
