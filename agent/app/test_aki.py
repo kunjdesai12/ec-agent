@@ -27,7 +27,7 @@ try:
 except ImportError:
     AUDIO_LIBS_AVAILABLE = False
 
-VOICE_MODE = False
+VOICE_MODE = True
 SAMPLE_RATE = 16000
 
 SESSION_ID = "14"

@@ -156,6 +156,7 @@ def params_complete(params: OrderParams) -> bool:
     return has_restaurant and has_items
 
 
+# REPLACE missing_fields_message:
 def missing_fields_message(params: OrderParams) -> str:
     """Generate a natural-language question for missing params."""
     missing = []

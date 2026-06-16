@@ -184,6 +184,13 @@ async def retrieve_node(state: GraphState) -> dict[str, Any]:
     """
     query = state["user_message"]
     order_params = state.get("order_params") or {}
+
+    # Skip re-retrieval if we already have RAG context from a prior turn
+    # cached_rag = order_params.get("_rag_context")
+    # if cached_rag:
+    #     log.info("retrieve_cache_hit", extra={"session_id": state.get("session_id")})
+    #     return {"rag_context": cached_rag, "restaurant_not_found": False}
+
     retriever = get_retriever()
 
     # Initialize so pure-discovery path never hits NameError
@@ -270,7 +277,7 @@ async def retrieve_node(state: GraphState) -> dict[str, Any]:
                     restaurant_id=matched_restaurant_id,
                 )
                 suggestion_str = ", ".join(
-                    f"{c.item_name} (\u20b9{c.price:.0f})" for c in sample
+                    f"{c.item_name} (₹{c.price:.0f})" for c in sample
                 ) if sample else "other items"
                 msg = (
                     f"Sorry, '{menu_item}' isn't available at {matched_restaurant_name}. "
@@ -327,8 +334,8 @@ async def retrieve_node(state: GraphState) -> dict[str, Any]:
 
         lines = [f"Here are the restaurants serving '{menu_item}' on EasyCater:\n"]
         for i, r in enumerate(unique_restaurants, 1):
-            rating_str = f" \u2b50{r['rating']:.1f}" if r["rating"] else ""
-            price_str  = f" \u00b7 \u20b9{r['price']:.0f}" if r["price"] else ""
+            rating_str = f" ⭐{r['rating']:.1f}" if r["rating"] else ""
+            price_str  = f" · ₹{r['price']:.0f}" if r["price"] else ""
             lines.append(f"{i}. {r['name']}{rating_str}{price_str}")
         lines.append("\nWhich restaurant would you like to order from?")
 
@@ -368,8 +375,14 @@ async def retrieve_node(state: GraphState) -> dict[str, Any]:
 
     ctx = format_chunks_for_prompt(chunks)
     log.info("rag_retrieved", extra={"n_chunks": len(chunks), "query": query[:80]})
+
+    # Cache RAG context in order_params so subsequent turns skip re-retrieval
+    # updated_params = dict(order_params)
+    # updated_params["_rag_context"] = ctx
+
     return {
         "rag_context": ctx,
+        # "order_params": updated_params,
         "restaurant_not_found": False,
         "item_rejected": False,
     }
@@ -389,10 +402,15 @@ async def llm_node(state: GraphState) -> dict[str, Any]:
 
     rag_ctx = state.get("rag_context", "")
     if rag_ctx:
+        insert_idx = len(messages)  # default: append at end
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user":
                 messages.insert(i, {"role": "system", "content": f"[CONTEXT]\n{rag_ctx}\n[/CONTEXT]"})
                 break
+        messages.insert(insert_idx, {
+            "role": "system",
+            "content": f"Current menu context for this order:\n{rag_ctx}"
+        })
 
     # ── Detect if all order details are confirmed → emit checkout signal ───────
     # Two-stage gate:
@@ -633,18 +651,44 @@ def should_continue(state: GraphState) -> str:
     iters = state.get("tool_iterations", 0)
     max_iters = get_settings().max_tool_iterations
 
-    if has_tool_calls and iters < max_iters:
-        return "tools"
-    if has_tool_calls and iters >= max_iters:
+    if not has_tool_calls:
+        return END
+
+    if iters >= max_iters:
         log.warning("tool_loop_exhausted", extra={"iterations": iters})
         return END
-    return END
+
+    return "tools"
+
+
+# REPLACE should_continue_after_tools:
+def should_continue_after_tools(state: GraphState) -> str:
+    messages = state["messages"]
+    recent_tool_names = []
+    for m in reversed(messages):
+        if m.get("role") == "tool":
+            recent_tool_names.append(m.get("name"))
+        elif m.get("role") == "assistant" and m.get("tool_calls"):
+            break
+
+    # End turn after get_user_addresses — need user to pick address
+    if "get_user_addresses" in recent_tool_names:
+        log.info("pausing_after_get_user_addresses")
+        return END
+
+    # End turn after place_order — order is done
+    if "place_order" in recent_tool_names:
+        log.info("pausing_after_place_order")
+        return END
+
+    return "llm"
 
 
 # ────────────────────────────────────────────────────────────────────────────
 # Graph build
 # ────────────────────────────────────────────────────────────────────────────
 
+# REPLACE build_graph() entirely:
 def build_graph():
     log.info("graph_building", extra={"entry": "intent", "nodes": "full_pipeline"})
     g = StateGraph(GraphState)
@@ -685,9 +729,7 @@ def build_graph():
 
     return g.compile()
 
-
 _graph = None
-
 
 def get_graph():
     global _graph
@@ -700,12 +742,41 @@ def get_graph():
 # Public API
 # ────────────────────────────────────────────────────────────────────────────
 
+
+def _sanitize_history(history: list[dict]) -> list[dict]:
+    """Remove tool result messages that have no matching assistant tool_call.
+    
+    These orphans occur when a turn is paused after tool execution and the
+    assistant message with tool_calls didn't get persisted alongside the result.
+    """
+    # Collect all tool_call_ids that appear in assistant messages
+    valid_tool_call_ids: set[str] = set()
+    for m in history:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                valid_tool_call_ids.add(tc["id"])
+
+    sanitized = []
+    for m in history:
+        if m.get("role") == "tool":
+            if m.get("tool_call_id") in valid_tool_call_ids:
+                sanitized.append(m)
+            else:
+                log.warning("dropping_orphan_tool_message", extra={
+                    "name": m.get("name"),
+                    "tool_call_id": m.get("tool_call_id"),
+                })
+        else:
+            sanitized.append(m)
+    return sanitized
+
+
 def build_initial_messages(
     history: list[dict[str, Any]],
     user_message: str,
 ) -> list[dict[str, Any]]:
     msgs: list[dict[str, Any]] = [{"role": "system", "content": AKI_SYSTEM_PROMPT}]
-    msgs.extend(history)
+    msgs.extend(_sanitize_history(history))
     msgs.append({"role": "user", "content": user_message})
     return msgs
 
@@ -755,8 +826,6 @@ async def run_turn(
     )
 
     final_text = final_state.get("final_text") or ""
-    if not final_text:
-        final_text = "Sorry, I had trouble completing that. Could you rephrase?"
 
     # ── Rebuild Valkey history ────────────────────────────────────────────────
     new_messages: list[dict[str, Any]] = []
