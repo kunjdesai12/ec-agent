@@ -28,13 +28,13 @@ log = logging.getLogger(__name__)
 DB_CONFIG = dict(
     dbname=os.getenv("VECTOR_DB_NAME", "vector_easycater"),
     user=os.getenv("VECTOR_DB_USER", "postgres"),
-    password=os.getenv("VECTOR_DB_PASSWORD"),        # ← moved to .env
+    password=os.getenv("VECTOR_DB_PASSWORD"),
     host=os.getenv("VECTOR_DB_HOST", "localhost"),
     port=os.getenv("VECTOR_DB_PORT", "5432"),
 )
 
 MODEL_NAME = "BAAI/bge-m3"
-BATCH_SIZE = 64   
+BATCH_SIZE = 64
 
 
 # ─── DB helpers ──────────────────────────────────────────────────────────────
@@ -56,8 +56,9 @@ def update_last_synced_at(cursor):
 
 def fetch_changed_rows(cursor, last_synced_at):
     """
-    Fetch rows that were updated OR recently deleted so we can
-    handle both upserts and removals in one pass.
+    No deleted_at column exists yet on restaurants_raw/menu_items/cuisines,
+    so this only catches updates — not deletions. Add deleted_at columns
+    later to enable proper soft-delete propagation into embeddings.
     """
     cursor.execute("""
         SELECT
@@ -71,20 +72,14 @@ def fetch_changed_rows(cursor, last_synced_at):
             price,
             latitude,
             longitude,
+            description
         FROM restaurant_menu_view
         WHERE updated_at > %s
     """, (last_synced_at,))
     return cursor.fetchall()
 
 
-# ─── Upsert / Delete ─────────────────────────────────────────────────────────
-
-def delete_embeddings(cursor, menu_item_ids: list):
-    cursor.execute(
-        "DELETE FROM restaurant_embeddings WHERE menu_item_id = ANY(%s)",
-        (menu_item_ids,)
-    )
-    log.info("Deleted embeddings for %d removed menu items", len(menu_item_ids))
+# ─── Upsert ──────────────────────────────────────────────────────────────────
 
 def upsert_batch(cursor, records):
     psycopg2.extras.execute_values(
@@ -122,24 +117,27 @@ def upsert_batch(cursor, records):
 
 def encode_batch(model, batch):
     """
-    Single encode call for all 4 fields concatenated, then slice.
-    4x faster than calling model.encode() separately for each field.
+    combined_text now includes description (via the view), so it's
+    automatically picked up here without extra changes to this function.
     """
-    # Build one flat list: [combined×N, name×N, food×N, cuisine×N]
-    combined_texts      = [row[4] or "" for row in batch]
-    restaurant_names    = [row[2] or "" for row in batch]
-    food_items          = [row[3] or "" for row in batch]
-    cuisine_names       = [row[5] or "" for row in batch]
+    combined_texts   = [row[4] or "" for row in batch]   # includes description
+    restaurant_names = [row[2] or "" for row in batch]
+    food_items       = [row[3] or "" for row in batch]
+    cuisine_names    = [row[5] or "" for row in batch]
 
     all_texts = combined_texts + restaurant_names + food_items + cuisine_names
-    all_vecs  = model.encode(all_texts, show_progress_bar=False)
+    all_vecs  = model.encode(
+        all_texts,
+        show_progress_bar=False,
+        normalize_embeddings=True,
+    )
 
     n = len(batch)
     return (
-        all_vecs[0*n : 1*n],   # combined embeddings
-        all_vecs[1*n : 2*n],   # restaurant name embeddings
-        all_vecs[2*n : 3*n],   # food item embeddings
-        all_vecs[3*n : 4*n],   # cuisine embeddings
+        all_vecs[0*n : 1*n],
+        all_vecs[1*n : 2*n],
+        all_vecs[2*n : 3*n],
+        all_vecs[3*n : 4*n],
     )
 
 
@@ -162,8 +160,6 @@ def run_sync():
         rows = fetch_changed_rows(cursor, last_synced_at)
         log.info("Fetched %d changed rows", len(rows))
 
-        # ── Always advance the timestamp, even if nothing changed ─────────
-        # Fixes the bug where early-return skipped update_last_synced_at
         if not rows:
             log.info("No rows changed — updating timestamp and exiting.")
             update_last_synced_at(cursor)
@@ -172,19 +168,10 @@ def run_sync():
             conn.close()
             return
 
-        # ── Split: deleted vs active ──────────────────────────────────────
-        deleted_ids = [row[0] for row in rows if row[10] is not None]  # deleted_at not null
-        active_rows = [row for row in rows if row[10] is None]
-
-        if deleted_ids:
-            delete_embeddings(cursor, deleted_ids)
-            conn.commit()
-
-        # ── Encode + upsert active rows in batches ────────────────────────
         total_upserted = 0
 
-        for i in tqdm(range(0, len(active_rows), BATCH_SIZE), desc="Batches"):
-            batch = active_rows[i : i + BATCH_SIZE]
+        for i in tqdm(range(0, len(rows), BATCH_SIZE), desc="Batches"):
+            batch = rows[i : i + BATCH_SIZE]
 
             combined_vecs, name_vecs, food_vecs, cuisine_vecs = encode_batch(model, batch)
 
@@ -194,7 +181,7 @@ def run_sync():
                     row[1],                         # restaurant_id
                     row[2],                         # restaurant_name
                     row[3],                         # food_item
-                    row[4],                         # combined_text
+                    row[4],                         # combined_text (now incl. description)
                     row[5],                         # cuisines_name
                     row[6],                         # rating
                     row[7],                         # price
@@ -212,7 +199,6 @@ def run_sync():
             conn.commit()
             total_upserted += len(records)
 
-        # ── Finalize ──────────────────────────────────────────────────────
         update_last_synced_at(cursor)
         conn.commit()
         cursor.close()
@@ -220,8 +206,8 @@ def run_sync():
 
         elapsed = (datetime.now() - start).total_seconds()
         log.info(
-            "Sync complete in %.1f s — upserted: %d, deleted: %d",
-            elapsed, total_upserted, len(deleted_ids)
+            "Sync complete in %.1f s — upserted: %d rows",
+            elapsed, total_upserted
         )
 
     except Exception:
