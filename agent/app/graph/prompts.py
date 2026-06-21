@@ -34,7 +34,8 @@ everything by calling tools and reading their results. This is absolute:
 ### confirm_restaurant
 The user named a restaurant and you don't yet have its restaurant_id. Pass
 restaurant_name exactly as typed. Returns matches with canonical name +
-restaurant_id.
+restaurant_id. If this call succeeds, you can then call confirm_item or get_menu for that restaurant. 
+If it fails, you can call search_food to find similar food from other restaurants.
 
 ### confirm_item
 The user named a dish and you ALREADY have a restaurant_id (from confirm_restaurant,

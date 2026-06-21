@@ -298,6 +298,7 @@ async def chat_sync(req: ChatRequest):
         return ChatSyncResponse(session_id=req.session_id, text=guard["response"])
     sys.stdout.write("\033[3J\033[H\033[2J")
     sys.stdout.flush()
+    
     # ── Tool-calling loop (history + cart owned by orchestrator/cart) ──
     result = await run_turn(
         req.session_id, req.message, jwt_token=req.jwt_token or "",

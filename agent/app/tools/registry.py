@@ -715,11 +715,15 @@ async def _get_menu(args: dict[str, Any]) -> dict[str, Any]:
         "listing_type": "instant"
     }
 
+    jwt_token = args.get("jwt_token", "")          # injected by execute_tool
+    headers = _auth_headers(jwt_token) if jwt_token else None
+
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
             response = await client.get(
                 f"{BASE_URL}/new-menu-item/getMenuItemsForUserByRestaurantId",
                 params=params,
+                headers=headers
             )
             
             response.raise_for_status()
@@ -776,12 +780,14 @@ async def _get_restaurant_details(args: dict[str, Any]) -> dict[str, Any]:
         return {"error": "restaurant_id is required", "status": "failed"}
 
     params = {"restaurantId": restaurant_id}
+    headers = _auth_headers(jwt_token) if jwt_token else None
 
     async with httpx.AsyncClient(timeout=12.0) as client:
         try:
             response = await client.get(
                 f"{BASE_URL}/new-menu-item/getMenuItemsForUserByRestaurantId",
                 params=params,
+                headers=headers
             )
             response.raise_for_status()
             data = response.json()
