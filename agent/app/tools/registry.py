@@ -11,6 +11,7 @@ to be re-prompted.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import datetime, timezone
@@ -20,6 +21,8 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 from agent.app.config import get_settings
+from agent.app.rag import get_retriever
+from agent.app import cart as cart_store
 
 load_dotenv()
 
@@ -83,6 +86,139 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "confirm_restaurant",
+            "description": (
+                "Resolve a restaurant the user named (by name, possibly partial or "
+                "misspelled) to a real EasyCater restaurant. Returns one or more "
+                "matched restaurants with their canonical name and restaurant_id. "
+                "Call this whenever the user names a restaurant and you do NOT already "
+                "have a confirmed restaurant_id for it from RAG context, a search_food "
+                "result, or an earlier confirm_restaurant call. Never pass a raw "
+                "user-typed restaurant name to get_menu or get_restaurant_details — "
+                "resolve it here first."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "restaurant_name": {
+                        "type": "string",
+                        "description": (
+                            "The restaurant name EXACTLY as the user typed it, e.g. "
+                            "'honest', 'saffron palace', 'sankalp'. Do not correct or "
+                            "expand it — the backend handles fuzzy matching."
+                        ),
+                    },
+                },
+                "required": ["restaurant_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "confirm_item",
+            "description": (
+                "Resolve a menu item the user named (possibly partial or misspelled) "
+                "to a real item on a SPECIFIC restaurant's menu. Returns matching "
+                "items with their canonical name, item_id and price. Requires a "
+                "restaurant_id — get it first from confirm_restaurant, search_food, "
+                "or get_menu. Call this whenever the user names a dish at a known "
+                "restaurant and you do not already have that item's item_id and price "
+                "from a tool result. Prefer this over reading out the whole menu when "
+                "the user already knows what they want. Never pass a user-typed dish "
+                "name to place_order — resolve it here (or via get_menu) first."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "restaurant_id": {
+                        "type": "string",
+                        "description": (
+                            "The restaurant whose menu to search (e.g. '30'). Must "
+                            "come from a prior tool result, never invented."
+                        ),
+                    },
+                    "item_name": {
+                        "type": "string",
+                        "description": (
+                            "The dish name EXACTLY as the user typed it, e.g. "
+                            "'pav bhaji', 'panir tikka'. Do not correct or expand it — "
+                            "the backend handles fuzzy matching."
+                        ),
+                    },
+                },
+                "required": ["restaurant_id", "item_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_to_cart",
+            "description": (
+                "Add an item to the current order (the cart). Call this once you "
+                "have the item's real restaurant_id, item_id, name and price from a "
+                "tool result (confirm_item, search_food, or get_menu). If the item "
+                "is already in the cart, this increases its quantity. The cart is "
+                "single-restaurant: adding from a different restaurant clears the "
+                "previous items (the result will say so). After this returns, the "
+                "updated cart appears in the [ORDER STATUS] block."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "restaurant_id": {"type": "string", "description": "From a tool result."},
+                    "restaurant_name": {"type": "string", "description": "Canonical name from a tool result."},
+                    "item_id": {"type": "string", "description": "From a tool result."},
+                    "item_name": {"type": "string", "description": "Canonical item name from a tool result."},
+                    "price": {"type": "number", "description": "Unit price in INR from a tool result."},
+                    "quantity": {"type": "integer", "description": "How many to add.", "default": 1},
+                },
+                "required": ["restaurant_id", "restaurant_name", "item_id", "item_name", "price"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_cart_item",
+            "description": (
+                "Set the quantity of an item already in the cart. Use this for "
+                "'make it 2', 'change it to 3', etc. A quantity of 0 (or less) "
+                "removes the item. Use the item_id shown in the [ORDER STATUS] "
+                "block. Returns the updated cart."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id": {"type": "string", "description": "item_id of a line already in the cart."},
+                    "quantity": {"type": "integer", "description": "New total quantity for that line. 0 removes it."},
+                },
+                "required": ["item_id", "quantity"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_from_cart",
+            "description": (
+                "Remove an item from the cart entirely. Use this for 'remove the "
+                "X', 'take off the Y'. Use the item_id shown in the [ORDER STATUS] "
+                "block. Returns the updated cart."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id": {"type": "string", "description": "item_id of the line to remove."},
+                },
+                "required": ["item_id"],
             },
         },
     },
@@ -374,53 +510,192 @@ def _auth_headers(jwt_token: str) -> dict[str, str]:
 # ────────────────────────────────────────────────────────────────────────────
 
 async def _search_food(args: dict[str, Any]) -> dict[str, Any]:
-    query = args.get("query", "")
+    """Discovery search, backed by the retriever (no HTTP semantic service).
+
+    Deterministic-first, matching the rest of the retriever's philosophy:
+      1. Treat the query as a dish name → exact/contains/trigram across
+         restaurants (retriever Path C).
+      2. If that finds nothing, fall back to vector discovery for vibe-style
+         queries like "something light and spicy" (retriever Path D).
+    """
+    query = (args.get("query") or "").strip()
     cuisine = args.get("cuisine")
     max_price = args.get("max_price")
 
-    # Parse query into fields — single field goes as menu_item
-    # unless it clearly looks like a restaurant name (handled by LLM upstream)
-    payload = {
-        "menu_item":    query,
-        "cuisine":      cuisine,
-        "max_price":    max_price,
-        "limit":        5,
-    }
+    if not query:
+        return {"results": [], "message": "Empty query"}
 
-    settings = get_settings()
+    retriever = get_retriever()
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                f"{settings.semantic_search_url}/search",
-                json=payload,
+        # Path C — dish-name match across restaurants.
+        chunks = await retriever.search(
+            query,
+            menu_item=query,
+            cuisine=cuisine,
+            max_price=max_price,
+        )
+        # Path D — vector discovery fallback when no name match.
+        if not chunks:
+            chunks = await retriever.search(
+                query,
+                cuisine=cuisine,
+                max_price=max_price,
             )
-            response.raise_for_status()
-            data = response.json()
-    except httpx.HTTPError as e:
-        return {"error": f"Semantic search unavailable: {e}"}
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"Search failed: {e}", "results": []}
 
-    top_matches = data.get("top_matches", [])
-
-    if not top_matches:
+    if not chunks:
         return {"results": [], "message": "No matches found"}
 
-    # Shape results for the LLM
     results = [
         {
-            "restaurant_id":   match.get("restaurant_id"),
-            "restaurant_name": match.get("restaurant_name"),
-            "item_id":         match.get("menu_item_id"),
-            "item_name":       match.get("food_item"),
-            "price":           match.get("price"),
-            "cuisine":         match.get("cuisine_name"),
-            "rating":          match.get("rating"),
-            "confidence":      match.get("similarity"),
+            "restaurant_id":   c.restaurant_id,
+            "restaurant_name": c.restaurant_name,
+            "item_id":         c.item_id,
+            "item_name":       c.item_name,
+            "price":           c.price,
+            "cuisine":         c.cuisine,
+            "rating":          c.rating,
+            "confidence":      c.metadata.get("similarity"),
         }
-        for match in top_matches
+        for c in chunks
     ]
 
     return {"results": results}
+
+
+async def _confirm_restaurant(args: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a user-typed restaurant name to real EasyCater restaurants.
+
+    Backed by the retriever's deterministic SQL hierarchy (exact -> contains ->
+    trigram over restaurant_embeddings) — the same matching used for RAG. No
+    embedding model is touched here; find_restaurant_candidates is pure SQL. The
+    retriever singleton is already warm from startup, so get_retriever() just
+    returns it.
+
+    Return shape (consumed by the model; restaurant_id is a STRING to match
+    get_menu / get_restaurant_details, which are the next calls the model makes):
+        {
+          "matches": [
+            {
+              "restaurant_id": "30",
+              "name": "Honest Restaurant",
+              "cuisine": "Gujarati",
+              "rating": 4.3,
+              "match_type": "exact" | "contains" | "trigram"
+            },
+            ...
+          ],
+          "query": "honest"
+        }
+    """
+    name = (args.get("restaurant_name") or "").strip()
+    if not name:
+        return {"matches": [], "query": args.get("restaurant_name", "")}
+
+    try:
+        # psycopg2 is sync — run the lookup off the event loop.
+        matches = await asyncio.to_thread(
+            get_retriever().find_restaurant_candidates, name, 5
+        )
+    except Exception as e:  # noqa: BLE001
+        return {"matches": [], "query": name, "error": f"Restaurant lookup failed: {e}"}
+
+    return {"matches": matches, "query": name}
+
+
+async def _confirm_item(args: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a user-typed dish name to real items on a known restaurant's menu.
+
+    Backed by the retriever's deterministic item matching (exact -> contains ->
+    trigram over restaurant_embeddings, scoped to the restaurant). Pure SQL — no
+    embedding model. The restaurant_id must come from a prior tool result
+    (confirm_restaurant / search_food / get_menu); the model must not invent it.
+
+    Return shape (item_id is a STRING, matching get_menu's item output and the
+    IDs place_order will consume):
+        {
+          "matches": [
+            {"item_id": "512", "name": "Butter Bhaji Pav", "price": 120.0,
+             "cuisine": "Gujarati", "match_type": "contains"},
+            ...
+          ],
+          "restaurant_id": "30",
+          "query": "pav bhaji"
+        }
+    Empty matches → the dish isn't on this menu; the model should offer real
+    alternatives (e.g. via get_menu), never invent one.
+    """
+    restaurant_id = str(args.get("restaurant_id") or "").strip()
+    item_name = (args.get("item_name") or "").strip()
+
+    if not restaurant_id:
+        return {
+            "matches": [],
+            "error": "restaurant_id is required — confirm the restaurant first.",
+        }
+    if not item_name:
+        return {"matches": [], "restaurant_id": restaurant_id, "query": item_name}
+
+    try:
+        matches = await asyncio.to_thread(
+            get_retriever().find_item_candidates, restaurant_id, item_name, 5
+        )
+    except Exception as e:  # noqa: BLE001
+        return {
+            "matches": [],
+            "restaurant_id": restaurant_id,
+            "query": item_name,
+            "error": f"Item lookup failed: {e}",
+        }
+
+    return {"matches": matches, "restaurant_id": restaurant_id, "query": item_name}
+
+
+# ── Cart handlers (session_id is injected by the orchestrator, not the LLM) ──
+
+def _require_session(args: dict[str, Any]) -> Optional[str]:
+    sid = args.get("session_id")
+    return str(sid) if sid else None
+
+
+async def _add_to_cart(args: dict[str, Any]) -> dict[str, Any]:
+    session_id = _require_session(args)
+    if not session_id:
+        return {"success": False, "error": "No active session."}
+    try:
+        return cart_store.add_item(
+            session_id,
+            restaurant_id=args.get("restaurant_id"),
+            restaurant_name=args.get("restaurant_name", ""),
+            item_id=args.get("item_id"),
+            name=args.get("item_name", ""),
+            price=args.get("price", 0),
+            quantity=args.get("quantity", 1),
+        )
+    except Exception as e:  # noqa: BLE001
+        return {"success": False, "error": f"Could not add to cart: {e}"}
+
+
+async def _update_cart_item(args: dict[str, Any]) -> dict[str, Any]:
+    session_id = _require_session(args)
+    if not session_id:
+        return {"success": False, "error": "No active session."}
+    item_id = args.get("item_id")
+    if item_id is None or "quantity" not in args:
+        return {"success": False, "error": "item_id and quantity are required."}
+    return cart_store.set_quantity(session_id, item_id, args.get("quantity"))
+
+
+async def _remove_from_cart(args: dict[str, Any]) -> dict[str, Any]:
+    session_id = _require_session(args)
+    if not session_id:
+        return {"success": False, "error": "No active session."}
+    item_id = args.get("item_id")
+    if item_id is None:
+        return {"success": False, "error": "item_id is required."}
+    return cart_store.remove_item(session_id, item_id)
 
 
 async def _get_menu(args: dict[str, Any]) -> dict[str, Any]:
@@ -853,11 +1128,12 @@ async def _cancel_order(args: dict[str, Any]) -> dict[str, Any]:
 async def _discard_current_order(args: dict[str, Any]) -> dict[str, Any]:
     """Discard the in-progress (scratchpad) order.
 
-    This is purely a LOCAL state operation — no backend call. The actual
-    clearing of order_params happens in run_turn() via the TERMINAL_TOOLS
-    reset when this tool returns success. This handler just acknowledges so
-    the model gets a clean success it can confirm to the user.
+    Clears the session cart. No backend call — the scratchpad lives only in the
+    in-memory cart store.
     """
+    session_id = args.get("session_id")
+    if session_id:
+        cart_store.clear(str(session_id))
     return {
         "success":   True,
         "discarded": True,
@@ -932,6 +1208,11 @@ async def _get_user_addresses(args: dict[str, Any]) -> dict[str, Any]:
 
 HANDLERS: dict[str, ToolHandler] = {
     "search_food": _search_food,
+    "confirm_restaurant": _confirm_restaurant,
+    "confirm_item": _confirm_item,
+    "add_to_cart": _add_to_cart,
+    "update_cart_item": _update_cart_item,
+    "remove_from_cart": _remove_from_cart,
     "get_menu": _get_menu,
     "get_restaurant_details": _get_restaurant_details,
     "place_order": _place_order,

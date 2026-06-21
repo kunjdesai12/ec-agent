@@ -159,6 +159,137 @@ class Retriever:
         # ── Path D: pure discovery — vector search over combined_text ─────────
         return await self._vector_search(query, cuisine, max_price, k)
 
+    # ── Tool-facing API ───────────────────────────────────────────────────────
+
+    def find_restaurant_candidates(self, name: str, limit: int = 5) -> list[dict]:
+        """Resolve a typed restaurant name to up to `limit` distinct restaurants.
+
+        Same exact → contains → trigram hierarchy as _find_restaurant, but returns
+        MULTIPLE candidates instead of stopping at the single best row — so the
+        confirm_restaurant tool can disambiguate when a query like "spice" matches
+        several different restaurants. Stops at the first tier that yields hits
+        (a `contains` hit never falls through to trigram), mirroring the rest of
+        the retriever's "first hit wins" philosophy.
+
+        Pure SQL — does NOT touch the embedding model. Rows are grouped to one per
+        restaurant_id; cuisine/rating are representative values for display only.
+
+        Returns a list of dicts shaped for the model (restaurant_id is a STRING to
+        line up with get_menu / get_restaurant_details):
+            [{"restaurant_id", "name", "cuisine", "rating", "match_type"}, ...]
+        Empty list means not found — caller should tell the user, not invent one.
+        """
+        name = (name or "").strip()
+        if not name:
+            return []
+
+        conn = self._get_conn()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # 1. Exact
+                cur.execute("""
+                    SELECT restaurant_id, restaurant_name,
+                           MIN(cuisine_name) AS cuisine_name,
+                           MAX(rating)       AS rating
+                    FROM restaurant_embeddings
+                    WHERE LOWER(restaurant_name) = LOWER(%s)
+                    GROUP BY restaurant_id, restaurant_name
+                    ORDER BY MAX(rating) DESC NULLS LAST
+                    LIMIT %s
+                """, (name, limit))
+                rows = cur.fetchall()
+                if rows:
+                    log.info("restaurant_candidates_exact", extra={
+                        "input": name, "n": len(rows)
+                    })
+                    return self._restaurant_rows(rows, "exact")
+
+                # 2. Contains
+                cur.execute("""
+                    SELECT restaurant_id, restaurant_name,
+                           MIN(cuisine_name) AS cuisine_name,
+                           MAX(rating)       AS rating
+                    FROM restaurant_embeddings
+                    WHERE LOWER(restaurant_name) LIKE LOWER(%s)
+                    GROUP BY restaurant_id, restaurant_name
+                    ORDER BY MAX(rating) DESC NULLS LAST
+                    LIMIT %s
+                """, (f"%{name}%", limit))
+                rows = cur.fetchall()
+                if rows:
+                    log.info("restaurant_candidates_contains", extra={
+                        "input": name, "n": len(rows)
+                    })
+                    return self._restaurant_rows(rows, "contains")
+
+                # 3. Trigram
+                cur.execute("""
+                    SELECT restaurant_id, restaurant_name,
+                           MIN(cuisine_name) AS cuisine_name,
+                           MAX(rating)       AS rating,
+                           MAX(similarity(LOWER(restaurant_name), LOWER(%s))) AS sim
+                    FROM restaurant_embeddings
+                    WHERE similarity(LOWER(restaurant_name), LOWER(%s)) > %s
+                    GROUP BY restaurant_id, restaurant_name
+                    ORDER BY sim DESC
+                    LIMIT %s
+                """, (name, name, _RESTAURANT_TRGM_THRESHOLD, limit))
+                rows = cur.fetchall()
+                if rows:
+                    log.info("restaurant_candidates_trigram", extra={
+                        "input": name,
+                        "n": len(rows),
+                        "top_sim": round(float(rows[0]["sim"]), 3),
+                    })
+                    return self._restaurant_rows(rows, "trigram")
+
+                log.info("restaurant_candidates_none", extra={"input": name})
+                return []
+        finally:
+            conn.close()
+
+    def _restaurant_rows(self, rows: list[dict], match_type: str) -> list[dict]:
+        """Project grouped restaurant rows into the model-facing dict shape."""
+        out = []
+        for r in rows:
+            out.append({
+                "restaurant_id": str(r["restaurant_id"]),
+                "name":          r["restaurant_name"] or "",
+                "cuisine":       r.get("cuisine_name") or "",
+                "rating":        float(r["rating"]) if r.get("rating") is not None else None,
+                "match_type":    match_type,
+            })
+        return out
+
+    def find_item_candidates(
+        self, restaurant_id: str, item_name: str, limit: int = 5
+    ) -> list[dict]:
+        """Resolve a typed dish name within a KNOWN restaurant to canonical items.
+
+        Wraps _find_items_in_restaurant (exact → contains → trigram) and projects
+        the MenuChunks into the model-facing dict shape for the confirm_item tool.
+        Pure SQL — no embedding model. Empty list means the dish is not on this
+        restaurant's menu (caller should offer real alternatives, not invent one).
+
+        Returns: [{"item_id", "name", "price", "cuisine", "match_type"}, ...]
+        """
+        restaurant_id = str(restaurant_id or "").strip()
+        item_name = (item_name or "").strip()
+        if not restaurant_id or not item_name:
+            return []
+
+        chunks = self._find_items_in_restaurant(restaurant_id, item_name, limit)
+        return [
+            {
+                "item_id":    c.item_id,
+                "name":       c.item_name,
+                "price":      c.price,
+                "cuisine":    c.cuisine,
+                "match_type": c.metadata.get("match_type", "unknown"),
+            }
+            for c in chunks
+        ]
+
     # ── Static SQL helpers ────────────────────────────────────────────────────
 
     def _find_restaurant(self, name: str) -> Optional[tuple[str, str]]:

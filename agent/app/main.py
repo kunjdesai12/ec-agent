@@ -1,16 +1,25 @@
 """EasyCater LLM API — FastAPI entrypoint.
 
 Endpoints:
-  POST /v1/auth/send-otp            — send OTP to user's phone (login)
-  POST /v1/auth/verify-otp          — verify OTP and get JWT token
+  POST /auth/send-otp               — send OTP to user's phone (login)
+  POST /auth/verify-otp             — verify OTP and get JWT token
   POST /v1/chat                     — SSE streaming chat
   POST /v1/chat/sync                — non-streaming variant (debug/tests)
   POST /v1/chat/voice               — voice chat (STT → chat pipeline)
   GET  /v1/health                   — liveness + Redis ping
-  POST /v1/session/{sid}/reset      — clear conversation history
+  GET  /v1/session/{sid}/cart       — read the in-progress cart
+  POST /v1/session/{sid}/checkout/complete — clear cart after order placed
+  POST /v1/session/{sid}/reset      — clear conversation history + cart
+
+Brain: the tool-calling orchestrator (agent.app.orchestrator.run_turn). It owns
+message history (in-memory) and drives the LLM ↔ tool loop. Order state lives in
+the cart module (agent.app.cart), not order_params. The model hands off to the
+checkout screen by emitting CONFIRMED on its own line; we strip that here and
+return the cart payload for the screen.
 """
 from __future__ import annotations
 import os
+import sys
 import asyncio
 import json
 from contextlib import asynccontextmanager
@@ -23,13 +32,12 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from agent.app.config import get_settings
-from agent.app.graph import run_turn
-from agent.app.graph.streaming import stream_turn
+from agent.app.graph.orchestrator import run_turn, clear_history
+from agent.app import cart
 from agent.app.guardrails_middleware import AkiGuardrails
 from agent.app.logging_setup import configure_logging, get_logger
-from agent.app.rag import get_retriever
-from agent.app.state import get_redis, load_history, reset_history, save_history
-from agent.app.state.history import load_order_params, save_order_params
+from agent.app.rag.retriever import get_retriever
+from agent.app.state import get_redis
 
 configure_logging()
 log = get_logger(__name__)
@@ -38,11 +46,15 @@ guardrails = AkiGuardrails()
 
 STT_API_ENDPOINT = get_settings().stt_api_endpoint
 
+# The model emits this on its own line to hand off to the checkout screen.
+CONFIRMED_SENTINEL = "CONFIRMED"
+
 ml_models = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: ARG001
-    # Warm up retriever (loads bge-m3 ~2GB into RAM)
+    # Warm up retriever (loads bge-m3 ~2GB into RAM) so the first
+    # confirm_restaurant / confirm_item / search_food call doesn't block.
     log.info("startup_begin")
     get_retriever()
     # Initialize guardrails
@@ -88,6 +100,12 @@ class ChatRequest(BaseModel):
 class ChatSyncResponse(BaseModel):
     session_id: str
     text: str
+    # New fields — the cart/checkout state for this turn. `text` is unchanged so
+    # existing clients keep working; richer clients can read the rest.
+    confirmed: bool = False
+    checkout: Optional[dict] = None
+    cart: Optional[dict] = None
+    terminal_tool: Optional[str] = None
 
 class VoiceJobResponse(BaseModel):
     session_id: str
@@ -100,6 +118,47 @@ class VoiceJobResultRequest(BaseModel):
 
 def clear_console():
     os.system("cls" if os.name == "nt" else "clear")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Turn helpers
+# ────────────────────────────────────────────────────────────────────────────
+
+def _split_confirmation(reply: str) -> tuple[str, bool]:
+    """Strip the CONFIRMED sentinel from the reply → (clean_text, confirmed).
+
+    The sentinel must be on its own line (per the prompt). We never show or
+    speak it to the user.
+    """
+    lines = reply.splitlines()
+    confirmed = any(line.strip() == CONFIRMED_SENTINEL for line in lines)
+    if not confirmed:
+        return reply, False
+    cleaned = "\n".join(l for l in lines if l.strip() != CONFIRMED_SENTINEL).strip()
+    return cleaned, True
+
+
+def _finalize(session_id: str, result: dict) -> tuple[str, bool, Optional[dict]]:
+    """Post-process a run_turn result: strip CONFIRMED, build checkout payload,
+    and clear the cart on a placed order.
+
+    Returns (clean_text, confirmed, checkout_payload).
+    """
+    text, confirmed = _split_confirmation(result["reply"])
+
+    # On CONFIRMED, hand the cart to the checkout screen but keep it — the screen
+    # needs the contents, and the user may return if they abandon checkout. The
+    # cart is cleared by /checkout/complete once the order is actually placed.
+    checkout = cart.summary(session_id) if confirmed else None
+
+    # discard_current_order already cleared the cart in its handler. If a
+    # place_order tool ran through the loop, clear here too. cancel_order is for
+    # an already-PLACED order and must NOT touch the building cart.
+    if result.get("terminal_tool") == "place_order":
+        cart.clear(session_id)
+
+    return text, confirmed, checkout
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # Endpoints
@@ -229,7 +288,6 @@ async def health():
 @app.post("/v1/chat/sync", response_model=ChatSyncResponse)
 async def chat_sync(req: ChatRequest):
     """Non-streaming chat — useful for tests and server-to-server calls."""
-    clear_console()
     # ── Guardrail input check ──────────────────────────────────
     guard = await guardrails.check_input(req.message, req.session_id)
     if guard["blocked"]:
@@ -238,32 +296,34 @@ async def chat_sync(req: ChatRequest):
             extra={"session_id": req.session_id, "violation": guard["violation"]},
         )
         return ChatSyncResponse(session_id=req.session_id, text=guard["response"])
-
-    # ── Normal pipeline ────────────────────────────────────────
-    history = await load_history(req.session_id)
-    order_params = await load_order_params(req.session_id)
-
-    text, new_history, updated_order_params = await run_turn(
-        req.session_id, req.message, history, order_params, jwt_token=req.jwt_token or "",
+    sys.stdout.write("\033[3J\033[H\033[2J")
+    sys.stdout.flush()
+    # ── Tool-calling loop (history + cart owned by orchestrator/cart) ──
+    result = await run_turn(
+        req.session_id, req.message, jwt_token=req.jwt_token or "",
     )
-
-    await save_history(
-        req.session_id,
-        history + [{"role": "user", "content": req.message}] + _without_user_dup(new_history, req.message),
+    text, confirmed, checkout = _finalize(req.session_id, result)
+ 
+    
+    return ChatSyncResponse(
+        session_id=req.session_id,
+        text=text,
+        confirmed=confirmed,
+        checkout=checkout,
+        cart=cart.summary(req.session_id),
+        terminal_tool=result.get("terminal_tool"),
     )
-    await save_order_params(req.session_id, updated_order_params)
-
-    return ChatSyncResponse(session_id=req.session_id, text=text)
 
 
 @app.post("/v1/chat")
 async def chat_stream(req: ChatRequest):
-    """SSE streaming chat. Events:
-       status, tool, token, done, error — see app/graph/streaming.py
-    """
-    history = await load_history(req.session_id)
-    order_params = await load_order_params(req.session_id)
+    """SSE chat. Events: status, tool, token, checkout, done, error.
 
+    NOTE: the tool-calling loop is not token-streaming, so the full reply is
+    emitted as a single `token` event. Tool names are emitted after the turn
+    completes. For true token-by-token streaming we'd need a streaming variant of
+    run_turn — see notes.
+    """
     async def event_gen():
         # ── Guardrail input check ──────────────────────────────
         guard = await guardrails.check_input(req.message, req.session_id)
@@ -276,29 +336,35 @@ async def chat_stream(req: ChatRequest):
             yield {"event": "done",  "data": json.dumps({"ok": True})}
             return
 
-        # ── Normal pipeline ────────────────────────────────────
-        persistable: list[dict] | None = None
-        updated_params: dict = order_params
         try:
-            async for event in stream_turn(
-                req.session_id, req.message, history, order_params, jwt_token=req.jwt_token or "",
-            ):
-                if event["type"] == "done":
-                    persistable = event["messages"]
-                    updated_params = event.get("order_params", {})
-                    yield {"event": "done", "data": json.dumps({"ok": True})}
-                else:
-                    yield {"event": event["type"], "data": json.dumps(event)}
+            yield {"event": "status", "data": json.dumps({"state": "thinking"})}
 
-            # Persist after the stream finishes successfully
-            if persistable is not None:
-                new_hist = history + persistable
-                await save_history(req.session_id, new_hist)
-                await save_order_params(req.session_id, updated_params)
+            result = await run_turn(
+                req.session_id, req.message, jwt_token=req.jwt_token or "",
+            )
+
+            for name in result.get("tool_calls", []):
+                yield {"event": "tool", "data": json.dumps({"name": name})}
+
+            text, confirmed, checkout = _finalize(req.session_id, result)
+            yield {"event": "token", "data": json.dumps({"text": text})}
+
+            if confirmed:
+                yield {"event": "checkout", "data": json.dumps({"checkout": checkout})}
+
+            yield {"event": "done", "data": json.dumps({
+                "ok": True,
+                "confirmed": confirmed,
+                "terminal_tool": result.get("terminal_tool"),
+                "cart": cart.summary(req.session_id),
+            })}
 
         except asyncio.CancelledError:
             log.info("client_disconnect", extra={"session_id": req.session_id})
             raise
+        except Exception as e:  # noqa: BLE001
+            log.error("chat_stream_failed", extra={"session_id": req.session_id, "err": str(e)})
+            yield {"event": "error", "data": json.dumps({"error": "Aki had a problem handling that."})}
 
     return EventSourceResponse(event_gen())
 
@@ -321,8 +387,8 @@ async def chat_voice(
         stt_response.raise_for_status()
  
     stt_data         = stt_response.json()
-    result           = stt_data.get("result", {})
-    transcribed_text = result.get("translated_text") or result.get("text")
+    result_stt       = stt_data.get("result", {})
+    transcribed_text = result_stt.get("translated_text") or result_stt.get("text")
  
     if not transcribed_text:
         log.warning(
@@ -342,41 +408,40 @@ async def chat_voice(
         )
         return ChatSyncResponse(session_id=session_id, text=guard["response"])
  
-    history      = await load_history(session_id)
-    order_params = await load_order_params(session_id)
- 
-    text, new_history, updated_order_params = await run_turn(
-        session_id,
-        transcribed_text,
-        history,
-        order_params,
-        jwt_token=jwt_token or "",
+    result = await run_turn(
+        session_id, transcribed_text, jwt_token=jwt_token or "",
     )
+    text, confirmed, checkout = _finalize(session_id, result)
  
-    await save_history(
-        session_id,
-        history
-        + [{"role": "user", "content": transcribed_text}]
-        + _without_user_dup(new_history, transcribed_text),
+    return ChatSyncResponse(
+        session_id=session_id,
+        text=text,
+        confirmed=confirmed,
+        checkout=checkout,
+        cart=cart.summary(session_id),
+        terminal_tool=result.get("terminal_tool"),
     )
-    await save_order_params(session_id, updated_order_params)
- 
-    return ChatSyncResponse(session_id=session_id, text=text)
+
+
+@app.get("/v1/session/{session_id}/cart")
+async def get_session_cart(session_id: str):
+    """Current cart for a session — for the checkout screen to read."""
+    return cart.summary(session_id)
+
+
+@app.post("/v1/session/{session_id}/checkout/complete")
+async def checkout_complete(session_id: str):
+    """Called by the checkout screen AFTER the order is successfully placed.
+
+    Clears the building cart so the next conversation starts clean.
+    """
+    cart.clear(session_id)
+    return {"ok": True, "session_id": session_id}
 
 
 @app.post("/v1/session/{session_id}/reset")
 async def reset_session(session_id: str):
-    await reset_history(session_id)
-    await save_order_params(session_id, {})  # clear order params too
+    """Clear conversation history and the in-progress cart (logout / start over)."""
+    clear_history(session_id)
+    cart.clear(session_id)
     return {"ok": True, "session_id": session_id}
-
-
-def _without_user_dup(new_msgs: list[dict], user_msg: str) -> list[dict]:
-    """Strip a leading user message from new_msgs if it duplicates user_msg.
-
-    `run_turn` returns messages that include the user message we just added,
-    because we built initial_messages with it. We avoid double-storing.
-    """
-    if new_msgs and new_msgs[0].get("role") == "user" and new_msgs[0].get("content") == user_msg:
-        return new_msgs[1:]
-    return new_msgs
