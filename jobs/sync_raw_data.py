@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 DB_CONFIG = dict(
     dbname=os.getenv("SYNC_DB_NAME", "postgres"),
     user=os.getenv("SYNC_DB_USER"),
-    password=os.getenv("SYNC_DB_PASSWORD"),      # ← moved to .env
+    password=os.getenv("SYNC_DB_PASSWORD"),
     host=os.getenv("SYNC_DB_HOST"),
     port=os.getenv("SYNC_DB_PORT", "6543"),
 )
@@ -36,11 +36,11 @@ DB_CONFIG = dict(
 # API endpoints
 RESTAURANTS_API = "{base_url}/restaurants/details-for-ai"
 MENU_ITEMS_API  = "{base_url}/new-menu-item/get-menu-items-for-ai"
-CUISINES_API    = "{base_url}/cuisines/details-for-ai"   # ← was missing
+CUISINES_API    = "{base_url}/cuisines/details-for-ai"
 
 # Constants
 SYNC_METADATA_ID = 2
-PAGE_LIMIT        = 1000
+PAGE_LIMIT       = 1000
 
 
 # ─── DB helpers ──────────────────────────────────────────────────────────────
@@ -95,7 +95,11 @@ def fetch_all_pages(endpoint, sync_after=None):
 # ─── Upsert / Delete helpers ─────────────────────────────────────────────────
 
 def sync_restaurants(cursor, records):
-    """Upsert active restaurants; delete soft-deleted ones."""
+    """
+    Upsert active restaurants; delete soft-deleted ones.
+    restaurants_raw columns: restaurant_id, restaurant_name, created_at,
+                              updated_at, latitude, longitude, rating
+    """
     to_delete = [r["restaurant_id"] for r in records if r.get("deleted_at")]
     to_upsert = [r for r in records if not r.get("deleted_at")]
 
@@ -107,26 +111,43 @@ def sync_restaurants(cursor, records):
         )
 
     if to_upsert:
-        rows = [(r["restaurant_id"], r["restaurant_name"]) for r in to_upsert]
+        rows = [
+            (
+                r["restaurant_id"],
+                r["restaurant_name"],
+                r.get("latitude"),
+                r.get("longitude"),
+                r.get("rating"),
+            )
+            for r in to_upsert
+        ]
         psycopg2.extras.execute_values(
             cursor,
             """
-            INSERT INTO restaurants_raw (restaurant_id, restaurant_name, updated_at)
+            INSERT INTO restaurants_raw
+                (restaurant_id, restaurant_name, latitude, longitude, rating, updated_at)
             VALUES %s
             ON CONFLICT (restaurant_id)
             DO UPDATE SET
                 restaurant_name = EXCLUDED.restaurant_name,
+                latitude        = EXCLUDED.latitude,
+                longitude       = EXCLUDED.longitude,
+                rating          = EXCLUDED.rating,
                 updated_at      = NOW()
             """,
             rows,
-            template="(%s, %s, NOW())",
+            template="(%s, %s, %s, %s, %s, NOW())",
         )
 
     return len(to_upsert), len(to_delete)
 
 
 def sync_menu_items(cursor, records):
-    """Upsert active menu items; delete soft-deleted ones."""
+    """
+    Upsert active menu items; delete soft-deleted ones.
+    menu_items columns: business_id, menu_item_id, title, created_at,
+                         updated_at, price, cuisines_id, description
+    """
     to_delete = [r["menu_item_id"] for r in records if r.get("deletedAt")]
     to_upsert = [r for r in records if not r.get("deletedAt")]
 
@@ -139,31 +160,45 @@ def sync_menu_items(cursor, records):
 
     if to_upsert:
         rows = [
-            (r["menu_item_id"], r["business_id"], r["title"], r["cuisines_id"], r.get("description"))
+            (
+                r["menu_item_id"],
+                r["business_id"],
+                r["title"],
+                r.get("price"),
+                r.get("cuisines_id"),
+                r.get("description"),
+            )
             for r in to_upsert
         ]
         psycopg2.extras.execute_values(
             cursor,
             """
-            INSERT INTO menu_items (menu_item_id, business_id, title, cuisines_id, description, updated_at)
+            INSERT INTO menu_items
+                (menu_item_id, business_id, title, price, cuisines_id, description, updated_at)
             VALUES %s
             ON CONFLICT (menu_item_id)
             DO UPDATE SET
                 business_id = EXCLUDED.business_id,
                 title       = EXCLUDED.title,
+                price       = EXCLUDED.price,
                 cuisines_id = EXCLUDED.cuisines_id,
                 description = EXCLUDED.description,
                 updated_at  = NOW()
             """,
             rows,
-            template="(%s, %s, %s, %s, %s, NOW())",
+            template="(%s, %s, %s, %s, %s, %s, NOW())",
         )
 
     return len(to_upsert), len(to_delete)
 
 
 def sync_cuisines(cursor, records):
-    """Upsert active cuisines; delete soft-deleted or inactive ones."""
+    """
+    Upsert active cuisines; delete soft-deleted or inactive ones
+    (based on flags from the API response — local cuisines table
+    itself has no deleted_at/status column per current schema).
+    cuisines columns: cuisines_id, created_at, cuisines_name, updated_at
+    """
     to_delete = [
         r["cuisines_id"] for r in records
         if r.get("deletedAt") or r.get("status") == "inactive"
@@ -205,7 +240,6 @@ def run_sync():
     log.info("Raw data sync job started")
     start = datetime.now()
 
-    # Default counts in case fetches return nothing (fixes UnboundLocalError)
     restaurant_upserted = restaurant_deleted = 0
     menu_upserted = menu_deleted = 0
     cuisine_upserted = cuisine_deleted = 0
@@ -250,7 +284,7 @@ def run_sync():
         # ── Cuisines ─────────────────────────────────────────────────────────
         log.info("Syncing cuisines")
         cuisines = fetch_all_pages(
-            CUISINES_API.format(base_url=BASE_URL), last_synced_at  # ← now paginated with sync_after
+            CUISINES_API.format(base_url=BASE_URL), last_synced_at
         )
         if cuisines:
             cuisine_upserted, cuisine_deleted = sync_cuisines(cursor, cuisines)
