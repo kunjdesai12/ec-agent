@@ -149,36 +149,59 @@ async def run_turn(
           "terminal_tool":  str | None,     # set if a TERMINAL_TOOL succeeded
           "tool_calls":     [str, ...],     # names called this turn (for logs)
         }
+
+    History strategy:
+        We persist everything the LLM sees within a turn EXCEPT the injected
+        system messages (order_status, developer_block) which are rebuilt fresh
+        every turn. This means history contains:
+
+            user
+            assistant (tool_calls)     ← Aki decided to call a tool
+            tool (result)              ← what the tool returned
+            tool (result)              ← second tool in same round if any
+            assistant (tool_calls)     ← Aki called another tool
+            tool (result)
+            assistant (final text)     ← Aki's final reply to the user
+
+        This gives the LLM full reasoning context across turns — it knows which
+        restaurants/items it already resolved and won't re-call tools for them.
     """
     history = await load_history(session_id)
 
-    # Build the working message list for this turn.
+    # ── Build working message list for this turn ──────────────────────────────
+    # Start with system prompt + full persisted history
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
     messages.extend(history)
 
-    # Inject the live cart as the [ORDER STATUS] block so the model always
-    # reasons against the real scratchpad, not its own memory. Rebuilt fresh
-    # every turn from the cart store; never persisted into history.
+    # Inject live cart as [ORDER STATUS] block — rebuilt fresh every turn,
+    # never persisted into history.
     order_status = cart_store.format_for_prompt(session_id)
     if order_status:
         messages.append({"role": "system", "content": order_status})
 
     if developer_block:
         messages.append({"role": "system", "content": developer_block})
-    messages.append({"role": "user", "content": user_message})
 
+    # Append this turn's user message to both working list and history
+    user_msg = {"role": "user", "content": user_message}
+    messages.append(user_msg)
+    history.append(user_msg)
+    
+    # ── Tool-calling loop ─────────────────────────────────────────────────────
     called_tools: list[str] = []
     terminal_tool: Optional[str] = None
     final_text = ""
 
-    #log.info("turn_start", extra={"session": session_id, "msgs": messages})
-
     for iteration in range(MAX_TOOL_ITERATIONS):
-        # On the final allowed iteration, drop tools so the model is forced to
-        # answer in words instead of requesting yet another call.
+        # On the final allowed iteration, drop tools so the model is forced
+        # to produce a text reply instead of another tool call.
         use_tools = iteration < MAX_TOOL_ITERATIONS - 1
-        
-        log.info("iterations", extra={"session": session_id, "msgs": messages})
+
+        log.info("turn_iteration", extra={
+            "session": session_id,
+            "iteration": iteration,
+            "use_tools": use_tools,
+        })
 
         resp = await _client.chat.completions.create(
             model=MODEL_NAME,
@@ -189,16 +212,17 @@ async def run_turn(
             max_tokens=MAX_TOKENS,
         )
         msg = resp.choices[0].message
-       
-       
-        # No tool calls → this is the user-facing reply. Done.
+
+        # ── No tool calls → this is the user-facing reply. Done. ─────────────
         if not getattr(msg, "tool_calls", None):
             final_text = (msg.content or "").strip()
+            # Persist final assistant reply to history
+            history.append({"role": "assistant", "content": final_text})
             break
 
-        # Record the assistant tool-call message before appending results
-        # (OpenAI message ordering requires this).
-        messages.append({
+        # ── Tool calls requested ──────────────────────────────────────────────
+        # Build the assistant message with tool_calls
+        assistant_msg = {
             "role": "assistant",
             "content": msg.content or "",
             "tool_calls": [
@@ -212,28 +236,16 @@ async def run_turn(
                 }
                 for tc in msg.tool_calls
             ],
-        })
-        # Execute each requested tool and append its result as a new message, to history.
-        history.append({
-            "role": "assistant",
-            "content": msg.content or "",
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in msg.tool_calls
-            ],
-        })
+        }
+        # Append to both working list and history
+        messages.append(assistant_msg)
+        history.append(assistant_msg)
 
-        # Execute each requested tool and append its result.
+        # ── Execute each tool and collect results ─────────────────────────────
         for tc in msg.tool_calls:
             name = tc.function.name
             called_tools.append(name)
+
             try:
                 raw_args = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError:
@@ -249,7 +261,7 @@ async def run_turn(
 
             result_json = await execute_tool(name, args)  # returns JSON string
 
-            # Track terminal-tool success so the caller can clear the scratchpad.
+            # Track terminal-tool success so caller can clear the scratchpad.
             if name in TERMINAL_TOOLS:
                 try:
                     if json.loads(result_json).get("success"):
@@ -257,34 +269,39 @@ async def run_turn(
                 except json.JSONDecodeError:
                     pass
 
-            messages.append({
+            tool_result_msg = {
                 "role": "tool",
                 "tool_call_id": tc.id,
                 "content": result_json,
-            })
+            }
 
-            history.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": result_json,
-            })
+            # Append to both working list and history
+            messages.append(tool_result_msg)
+            history.append(tool_result_msg)
 
         log.info("tool_round", extra={
-            "session": session_id, "iteration": iteration,
+            "session": session_id,
+            "iteration": iteration,
             "tools": [tc.function.name for tc in msg.tool_calls],
         })
+
     else:
-        # Loop exhausted without a plain reply.
+        # Loop exhausted without a plain reply — force a fallback.
         final_text = (
             "Sorry, I got a bit tangled up there. Could you tell me again what "
             "you'd like to order?"
         )
+        history.append({"role": "assistant", "content": final_text})
         log.warning("tool_loop_exhausted", extra={"session": session_id})
 
-    # Persist only the user turn and the final assistant text (not the
-    # intermediate tool rounds) to keep history small and replayable.
-    history.append({"role": "user", "content": user_message})
-    history.append({"role": "assistant", "content": final_text})
+    # ── Persist full history for this turn ────────────────────────────────────
+    # history now contains:
+    #   ...previous turns...
+    #   user message
+    #   assistant (tool_calls) × N rounds
+    #   tool results × N rounds
+    #   assistant (final text)
+    log.info("turn_complete", extra={"session": session_id, "messages": history})
     await save_history(session_id, history)
 
     return {
