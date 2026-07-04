@@ -255,7 +255,6 @@ class Retriever:
             out.append({
                 "restaurant_id": str(r["restaurant_id"]),
                 "name":          r["restaurant_name"] or "",
-                "cuisine":       r.get("cuisine_name") or "",
                 "rating":        float(r["rating"]) if r.get("rating") is not None else None,
                 "match_type":    match_type,
             })

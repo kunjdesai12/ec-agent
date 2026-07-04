@@ -177,10 +177,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "restaurant_name": {"type": "string", "description": "Canonical name from a tool result."},
                     "item_id": {"type": "string", "description": "From a tool result."},
                     "item_name": {"type": "string", "description": "Canonical item name from a tool result."},
-                    "price": {"type": "number", "description": "Unit price in INR from a tool result."},
                     "quantity": {"type": "integer", "description": "How many to add.", "default": 1},
                 },
-                "required": ["restaurant_id", "restaurant_name", "item_id", "item_name", "price"],
+                "required": ["restaurant_id", "restaurant_name", "item_id", "item_name", "quantity"],
             },
         },
     },
@@ -279,10 +278,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         },
                         "description": "List of menu item IDs selected by the customer."
                     },
-                    "price": {
-                        "type": "number",
-                        "description": "Base price of each menu item."
-                    },
                     "order_type": {
                         "type": "string",
                         "enum": ["delivery", "pickup", "dinein"],
@@ -351,7 +346,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "required": [
                     "restaurant_id",
                     "menu_item_ids",
-                    "price",
+                    "quantity",
                     "order_type",
                     "delivery_address",
                 ]
@@ -581,7 +576,6 @@ async def _confirm_restaurant(args: dict[str, Any]) -> dict[str, Any]:
             {
               "restaurant_id": "30",
               "name": "Honest Restaurant",
-              "cuisine": "Gujarati",
               "rating": 4.3,
               "match_type": "exact" | "contains" | "trigram"
             },
@@ -863,7 +857,6 @@ async def _place_order(args: dict[str, Any]) -> dict[str, Any]:
     """
     restaurant_id      = args.get("restaurant_id")
     menu_item_ids      = args.get("menu_item_ids", [])
-    price              = args.get("price", 0)
     order_type         = args.get("order_type", "delivery")
     delivery_address   = args.get("delivery_address", {})
     quantity           = args.get("quantity", 1)
