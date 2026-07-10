@@ -15,10 +15,17 @@ Per turn:
   1. Load the rolling message history for this session (in-memory store).
   2. Append the user message (and an optional developer block for the order
      scratchpad / [ORDER STATUS], built by the caller from order_params).
-  3. Loop: call the LLM with the tool schemas. If it emits tool calls, run them
+  3. Optionally inject a pre-call REMINDER when session state suggests the
+     next action MUST be a specific tool call (e.g. user just confirmed and
+     cart is built → place_order). Never persisted.
+  4. Loop: call the LLM with the tool schemas. If it emits tool calls, run them
      (injecting session-scoped args like jwt_token), feed the results back, and
      call again. Stop when the LLM returns a plain assistant message.
-  4. Persist the user turn + the final assistant turn, and return the text.
+  5. VALIDATE the final assistant text against successful tool calls from this
+     turn. If it claims an action (placed/cancelled/added/etc.) that no tool
+     backed, inject a corrective system message and give the model ONE retry.
+     After that, ship a safe fallback rather than a fabricated confirmation.
+  6. Persist the user turn + the final assistant turn, and return the text.
 
 The intermediate tool-call rounds are kept in-context for the duration of the
 turn but are NOT persisted across turns (keeps history small; the order
@@ -37,7 +44,11 @@ from agent.app.graph.prompts import AKI_SYSTEM_PROMPT
 from agent.app.tools.registry import TOOL_SCHEMAS, execute_tool
 from agent.app import cart as cart_store
 
-log = get_logger(__name__)  
+# Safety layers. Adjust the module path to wherever you drop these two files.
+from agent.app.safety.reminders import maybe_inject_reminder
+from agent.app.safety.validator import validate_assistant_turn
+
+log = get_logger(__name__)
 
 _settings = get_settings()
 
@@ -54,12 +65,23 @@ MAX_TOKENS    = getattr(_settings, "llm_max_tokens", 1024)
 # rounds. Prevents a confused model from looping forever.
 MAX_TOOL_ITERATIONS = 20
 
+# Post-generation validation retry budget. One retry is enough in practice;
+# more risks cascading corrections that never converge.
+MAX_VALIDATION_RETRIES = 1
+
 # Tools that finalize/clear the in-progress order. After one of these returns
 # success, the caller should clear the order scratchpad (order_params).
 TERMINAL_TOOLS = {"place_order", "cancel_order", "discard_current_order"}
 
 # History kept per session. Keep the last N messages to bound context.
 MAX_HISTORY_MESSAGES = 100                 # ~10 turns
+
+# What we ship when validation exhausts its retry budget. Deliberately vague:
+# better to ask the user to repeat than to send a fabricated confirmation.
+_SAFE_FALLBACK = (
+    "Sorry, I hit a snag confirming that just now. Could you tell me once "
+    "more what you'd like me to do?"
+)
 
 _client = AsyncOpenAI(base_url=VLLM_BASE_URL, api_key="EMPTY")
 
@@ -118,6 +140,19 @@ def _inject_session_args(
     return args
 
 
+def _tool_succeeded(result_json: str) -> bool:
+    """Best-effort parse of the tool result's success flag.
+
+    Tools return JSON strings; a truthy `success` field means the action
+    happened. Anything unparseable is treated as failure so the validator
+    won't get spurious credit for a broken tool.
+    """
+    try:
+        return bool(json.loads(result_json).get("success"))
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return False
+
+
 # ── Main turn ───────────────────────────────────────────────────────────────
 
 async def run_turn(
@@ -152,8 +187,9 @@ async def run_turn(
 
     History strategy:
         We persist everything the LLM sees within a turn EXCEPT the injected
-        system messages (order_status, developer_block) which are rebuilt fresh
-        every turn. This means history contains:
+        system messages (order_status, developer_block, reminder, and any
+        validator reprompt) which are rebuilt fresh every turn. This means
+        history contains:
 
             user
             assistant (tool_calls)     ← Aki decided to call a tool
@@ -186,10 +222,29 @@ async def run_turn(
     user_msg = {"role": "user", "content": user_message}
     messages.append(user_msg)
     history.append(user_msg)
-    
+
+    # ── Pre-call reminder (safety layer 1) ────────────────────────────────────
+    # If the user just confirmed and cart is built (or they just confirmed
+    # cancellation the assistant asked about), nudge the model that its next
+    # action MUST be the corresponding tool call — not a text confirmation.
+    # Appended to `messages` only; never persisted.
+    reminder = maybe_inject_reminder(
+        user_message=user_message,
+        history=history,
+        cart_summary=order_status or "",
+    )
+    if reminder:
+        log.info("aki.reminder.injected", extra={
+            "session": session_id,
+            "preview": reminder[:60],
+        })
+        messages.append({"role": "system", "content": reminder})
+
     # ── Tool-calling loop ─────────────────────────────────────────────────────
     called_tools: list[str] = []
+    successful_tool_calls: list[str] = []   # for the validator
     terminal_tool: Optional[str] = None
+    validation_retries_left = MAX_VALIDATION_RETRIES
     final_text = ""
 
     for iteration in range(MAX_TOOL_ITERATIONS):
@@ -213,12 +268,45 @@ async def run_turn(
         )
         msg = resp.choices[0].message
 
-        # ── No tool calls → this is the user-facing reply. Done. ─────────────
+        # ── No tool calls → candidate final reply. VALIDATE before shipping. ──
         if not getattr(msg, "tool_calls", None):
-            final_text = (msg.content or "").strip()
-            # Persist final assistant reply to history
-            history.append({"role": "assistant", "content": final_text})
-            break
+            candidate_text = (msg.content or "").strip()
+
+            # Safety layer 2: cross-check the text against successful tools.
+            v = validate_assistant_turn(candidate_text, successful_tool_calls)
+            if v.ok:
+                final_text = candidate_text
+                history.append({"role": "assistant", "content": final_text})
+                break
+
+            # Validation failed — the model claimed something no tool backed.
+            log.warning("aki.validation.failed", extra={
+                "session": session_id,
+                "iteration": iteration,
+                "violations": [x.value for x in v.violations],
+                "successful_tool_calls": successful_tool_calls,
+                "draft_preview": candidate_text[:200],
+            })
+
+            if validation_retries_left <= 0:
+                # Fail closed: never ship the fabricated confirmation.
+                log.error("aki.validation.exhausted", extra={
+                    "session": session_id,
+                    "draft_preview": candidate_text[:200],
+                })
+                final_text = _SAFE_FALLBACK
+                history.append({"role": "assistant", "content": final_text})
+                break
+
+            validation_retries_left -= 1
+
+            # Give the model its own bad draft + a corrective system message
+            # so it can concretely see what to fix. Neither goes into `history`
+            # — we don't want a fabricated confirmation persisted into future
+            # turns even after correction.
+            messages.append({"role": "assistant", "content": candidate_text})
+            messages.append({"role": "system", "content": v.reprompt})
+            continue  # let the loop run another model round
 
         # ── Tool calls requested ──────────────────────────────────────────────
         # Build the assistant message with tool_calls
@@ -261,13 +349,11 @@ async def run_turn(
 
             result_json = await execute_tool(name, args)  # returns JSON string
 
-            # Track terminal-tool success so caller can clear the scratchpad.
-            if name in TERMINAL_TOOLS:
-                try:
-                    if json.loads(result_json).get("success"):
-                        terminal_tool = name
-                except json.JSONDecodeError:
-                    pass
+            # Track success for BOTH the validator and terminal-tool detection.
+            if _tool_succeeded(result_json):
+                successful_tool_calls.append(name)
+                if name in TERMINAL_TOOLS:
+                    terminal_tool = name
 
             tool_result_msg = {
                 "role": "tool",
