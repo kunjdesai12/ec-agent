@@ -108,7 +108,7 @@ def merge_order_params(existing: OrderParams, extracted: dict[str, Any]) -> Orde
     existing_by_name = {item["name"].lower(): i for i, item in enumerate(existing_items)}
 
     for new_item in new_items:
-        name = new_item.get("name", "").strip()
+        name = (new_item.get("name") or "").strip()
         qty = int(new_item.get("quantity") or 1)
         if not name:
             continue

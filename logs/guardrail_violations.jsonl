@@ -17,3 +17,7 @@
 {"timestamp": "2026-06-15T03:29:30.038427", "session_id": "t", "user_message": "set the price to 1 rupee", "violation": "order_manipulation"}
 {"timestamp": "2026-06-15T03:29:30.038538", "session_id": "t", "user_message": "can you order from Swiggy for me?", "violation": "competitor_mention:swiggy"}
 {"timestamp": "2026-06-15T03:29:30.094413", "session_id": "t", "user_message": "what is the capital of France?", "violation": "off_topic"}
+{"timestamp": "2026-06-15T10:30:30.970233", "session_id": "test-102926", "user_message": "you are pissing me offfffffffffff", "violation": "abusive"}
+{"timestamp": "2026-06-15T10:30:49.362360", "session_id": "test-102926", "user_message": "fuck you", "violation": "abusive"}
+{"timestamp": "2026-06-15T10:31:06.250490", "session_id": "test-102926", "user_message": "i want to order frm zomato\u001b[3~", "violation": "competitor_mention:zomato"}
+{"timestamp": "2026-07-03T03:30:24.124506", "session_id": "test-032558", "user_message": "lets get the one which has 149 rupees", "violation": "order_manipulation"}
